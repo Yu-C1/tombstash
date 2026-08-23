@@ -3,6 +3,9 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
+
+#include "lsmkv/record.h"
 
 namespace lsmkv {
 
@@ -24,6 +27,10 @@ public:
     // Whether the key is present as a tombstone in this memtable. Needed later
     // so a memtable delete can shadow a value living in an older SSTable.
     bool is_tombstone(const std::string& key) const;
+
+    // All entries in ascending key order, tombstones included, as records ready
+    // to write to an SSTable on flush.
+    std::vector<Record> snapshot() const;
 
     std::size_t entry_count() const { return entries_.size(); }
 

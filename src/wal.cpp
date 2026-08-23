@@ -9,25 +9,13 @@
 #include <system_error>
 #include <utility>
 
+#include "lsmkv/encoding.h"
+
 namespace lsmkv {
 
 namespace {
 
 constexpr std::size_t kLenSize = sizeof(uint32_t);
-
-void put_u32_le(std::string& buf, uint32_t v) {
-    buf.push_back(static_cast<char>(v & 0xff));
-    buf.push_back(static_cast<char>((v >> 8) & 0xff));
-    buf.push_back(static_cast<char>((v >> 16) & 0xff));
-    buf.push_back(static_cast<char>((v >> 24) & 0xff));
-}
-
-uint32_t read_u32_le(const char* p) {
-    return static_cast<uint32_t>(static_cast<unsigned char>(p[0])) |
-           (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 8) |
-           (static_cast<uint32_t>(static_cast<unsigned char>(p[2])) << 16) |
-           (static_cast<uint32_t>(static_cast<unsigned char>(p[3])) << 24);
-}
 
 // Write the whole buffer, retrying short and interrupted writes.
 void write_all(int fd, const char* data, std::size_t len) {
@@ -44,8 +32,9 @@ void write_all(int fd, const char* data, std::size_t len) {
 
 }  // namespace
 
-Wal::Wal(std::string path) : path_(std::move(path)) {
-    fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+Wal::Wal(std::string path, bool truncate) : path_(std::move(path)) {
+    int flags = O_WRONLY | O_CREAT | O_APPEND | (truncate ? O_TRUNC : 0);
+    fd_ = ::open(path_.c_str(), flags, 0644);
     if (fd_ < 0) {
         throw std::system_error(errno, std::generic_category(),
                                 "WAL open: " + path_);
@@ -82,9 +71,9 @@ void Wal::append(const Record& rec) {
     std::string buf;
     buf.reserve(1 + kLenSize + rec.key.size() + kLenSize + rec.value.size());
     buf.push_back(static_cast<char>(rec.op));
-    put_u32_le(buf, static_cast<uint32_t>(rec.key.size()));
+    enc::put_u32_le(buf, static_cast<uint32_t>(rec.key.size()));
     buf.append(rec.key);
-    put_u32_le(buf, static_cast<uint32_t>(rec.value.size()));
+    enc::put_u32_le(buf, static_cast<uint32_t>(rec.value.size()));
     buf.append(rec.value);
 
     write_all(fd_, buf.data(), buf.size());
@@ -127,13 +116,13 @@ std::vector<Record> Wal::replay(const std::string& path) {
         if (pos + 1 + kLenSize > size) break;  // torn record
         Op op = static_cast<Op>(static_cast<unsigned char>(data[pos]));
         std::size_t p = pos + 1;
-        uint32_t klen = read_u32_le(data.data() + p);
+        uint32_t klen = enc::read_u32_le(data.data() + p);
         p += kLenSize;
         if (p + klen > size) break;  // torn
         std::string key = data.substr(p, klen);
         p += klen;
         if (p + kLenSize > size) break;  // torn
-        uint32_t vlen = read_u32_le(data.data() + p);
+        uint32_t vlen = enc::read_u32_le(data.data() + p);
         p += kLenSize;
         if (p + vlen > size) break;  // torn
         std::string value = data.substr(p, vlen);

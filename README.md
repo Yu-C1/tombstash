@@ -7,14 +7,14 @@ into sequential ones, which is fast for write-heavy workloads.
 
 ## Status
 
-Week 1 (foundations) in progress:
-
 - [x] Memtable — `put` / `get` / `del` over `std::map`, tombstones, byte accounting
 - [x] Write-ahead log — length-prefixed records, `fsync` per append, replay on open
 - [x] Durable DB — WAL + memtable, crash recovery via replay
-- [x] Unit tests from day one (GoogleTest)
-- [ ] SSTable flush (Week 2)
-- [ ] Bloom filters (Week 2)
+- [x] SSTable flush — sorted immutable files (data / index / bloom / footer)
+- [x] Bloom filters — per SSTable, sized by target FPR, double hashing
+- [x] Read path — memtable → SSTables newest→oldest, Bloom skips, binary search
+- [x] Recovery — load SSTables + replay WAL; atomic flush (tmp+rename+dir fsync)
+- [x] 33 GoogleTest cases, all passing
 - [ ] Size-tiered compaction (Week 3)
 - [ ] Benchmarks + CLI (Week 4)
 

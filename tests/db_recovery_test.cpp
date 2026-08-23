@@ -64,6 +64,7 @@ TEST_F(DBTest, LatestValueWinsAfterRecovery) {
 
 TEST_F(DBTest, EmptyDirStartsEmpty) {
     DB db(dir_.string());
-    EXPECT_EQ(db.entry_count(), 0u);
+    EXPECT_EQ(db.memtable_entry_count(), 0u);
+    EXPECT_EQ(db.sstable_count(), 0u);
     EXPECT_FALSE(db.get("anything").has_value());
 }

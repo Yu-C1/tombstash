@@ -14,8 +14,10 @@ namespace lsmkv {
 class Wal {
 public:
     // Open (creating if needed) the log at path for appending. Existing contents
-    // are preserved; new records append to the end.
-    explicit Wal(std::string path);
+    // are preserved unless truncate is set, which starts the log empty -- used
+    // after a flush, when the memtable's data is durable in an SSTable and the
+    // old log is no longer needed for recovery.
+    explicit Wal(std::string path, bool truncate = false);
     ~Wal();
 
     Wal(const Wal&) = delete;

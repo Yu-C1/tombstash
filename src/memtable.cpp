@@ -47,4 +47,14 @@ bool Memtable::is_tombstone(const std::string& key) const {
     return it != entries_.end() && it->second.tombstone;
 }
 
+std::vector<Record> Memtable::snapshot() const {
+    std::vector<Record> out;
+    out.reserve(entries_.size());
+    for (const auto& [key, entry] : entries_) {
+        out.push_back(Record{entry.tombstone ? Op::Delete : Op::Put, key,
+                             entry.value});
+    }
+    return out;
+}
+
 }  // namespace lsmkv

@@ -21,6 +21,8 @@ endif()
 add_library(lsmkv
   src/memtable.cpp
   src/wal.cpp
+  src/bloom_filter.cpp
+  src/sstable.cpp
   src/db.cpp)
 target_include_directories(lsmkv PUBLIC include)
 target_compile_options(lsmkv PRIVATE -Wall -Wextra -Wpedantic)
@@ -33,6 +35,9 @@ include(GoogleTest)
 add_executable(unit_tests
   tests/memtable_test.cpp
   tests/wal_recovery_test.cpp
-  tests/db_recovery_test.cpp)
+  tests/bloom_filter_test.cpp
+  tests/sstable_test.cpp
+  tests/db_recovery_test.cpp
+  tests/db_sstable_test.cpp)
 target_link_libraries(unit_tests PRIVATE lsmkv GTest::gtest GTest::gtest_main)
 gtest_discover_tests(unit_tests)
