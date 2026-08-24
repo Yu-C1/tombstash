@@ -11,8 +11,11 @@
 #include <mutex>
 #include <shared_mutex>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include "lsmkv/compaction.h"
 
 namespace lsmkv {
 
@@ -56,8 +59,7 @@ std::optional<std::uint64_t> parse_seq(const std::string& name) {
     return static_cast<std::uint64_t>(std::stoull(digits));
 }
 
-// fsync the directory so a newly created file's name is itself durable. Without
-// this a crash could lose the rename even though the file's bytes are on disk.
+// fsync the directory so a newly created file's name is itself durable.
 void fsync_dir(const std::string& dir) {
     int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
@@ -74,10 +76,13 @@ void fsync_dir(const std::string& dir) {
 
 }  // namespace
 
-DB::DB(const std::string& dir, std::size_t memtable_threshold)
+DB::DB(const std::string& dir, std::size_t memtable_threshold,
+       std::size_t min_merge, double size_ratio)
     : dir_(dir),
       wal_path_(prepare_wal_path(dir)),
       threshold_(memtable_threshold),
+      min_merge_(min_merge),
+      size_ratio_(size_ratio),
       wal_(wal_path_) {
     load_sstables();
     // Replay the WAL (writes made since the last flush) back into the memtable.
@@ -88,6 +93,18 @@ DB::DB(const std::string& dir, std::size_t memtable_threshold)
             memtable_.del(rec.key);
         }
     }
+    // Start the background compactor. If the loaded SSTables already qualify, it
+    // will pick that up on its first wait (the predicate is checked immediately).
+    compactor_ = std::thread(&DB::compaction_loop, this);
+}
+
+DB::~DB() {
+    {
+        std::unique_lock lock(mu_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    if (compactor_.joinable()) compactor_.join();
 }
 
 void DB::load_sstables() {
@@ -97,7 +114,7 @@ void DB::load_sstables() {
     for (const auto& entry : fs::directory_iterator(dir_)) {
         if (!entry.is_regular_file()) continue;
         std::string name = entry.path().filename().string();
-        // Remove leftover temp files from a flush interrupted by a crash.
+        // Remove leftover temp files from a flush/compaction cut short by a crash.
         if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
             fs::remove(entry.path());
             continue;
@@ -142,6 +159,84 @@ void DB::flush_locked() {
     //    needed for recovery -- truncate it. (A crash before this point simply
     //    replays the WAL on top of the SSTable, which is harmless.)
     wal_ = Wal(wal_path_, /*truncate=*/true);
+
+    // A new table may have completed a size tier -- wake the compactor (and any
+    // wait_for_idle waiter). notify_all so a waiter can't consume the wakeup
+    // meant for the compactor and stall progress.
+    cv_.notify_all();
+}
+
+bool DB::compaction_pending() const {
+    return pick_compaction(sstables_, min_merge_, size_ratio_).has_value();
+}
+
+void DB::compaction_loop() {
+    for (;;) {
+        std::vector<std::shared_ptr<SSTable>> inputs;
+        bool drop_tombstones = false;
+        std::string final_path;
+        std::string tmp_path;
+
+        {
+            std::unique_lock lock(mu_);
+            cv_.wait(lock, [this] { return stop_ || compaction_pending(); });
+            if (stop_) return;
+
+            auto pick = pick_compaction(sstables_, min_merge_, size_ratio_);
+            if (!pick) continue;  // spurious wakeup
+
+            for (std::size_t idx : pick->indices) inputs.push_back(sstables_[idx]);
+            drop_tombstones = pick->drop_tombstones;
+
+            std::uint64_t seq = next_seq_++;
+            final_path = (fs::path(dir_) / sst_name(seq)).string();
+            tmp_path = final_path + ".tmp";
+            compacting_ = true;
+        }
+
+        // Slow work with NO lock held: merge the inputs and write the new file.
+        std::vector<Record> merged = merge_records(inputs, drop_tombstones);
+        SSTable::build(tmp_path, merged);
+        if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+            throw std::system_error(errno, std::generic_category(),
+                                    "compaction rename: " + tmp_path);
+        }
+        fsync_dir(dir_);
+        auto output = std::make_shared<SSTable>(final_path);
+
+        {
+            std::unique_lock lock(mu_);
+            // Replace the inputs with the single merged output, placed at the age
+            // slot of the newest input so newest-wins stays correct. Inputs are
+            // matched by pointer identity, since the list may have gained newer
+            // tables from flushes while we merged.
+            std::unordered_set<const SSTable*> input_set;
+            for (const auto& sp : inputs) input_set.insert(sp.get());
+
+            std::vector<std::shared_ptr<SSTable>> next;
+            next.reserve(sstables_.size());
+            bool inserted = false;
+            for (const auto& sp : sstables_) {
+                if (input_set.count(sp.get())) {
+                    sp->mark_obsolete();  // unlinked when the last reader releases
+                    if (!inserted) {
+                        next.push_back(output);
+                        inserted = true;
+                    }
+                } else {
+                    next.push_back(sp);
+                }
+            }
+            if (!inserted) next.push_back(output);  // defensive: inputs all gone
+            sstables_ = std::move(next);
+
+            compacting_ = false;
+            // Drop our own references so obsolete files can be unlinked promptly
+            // once any outstanding reader snapshots release them.
+            inputs.clear();
+            cv_.notify_all();  // wake wait_for_idle and re-check for more work
+        }
+    }
 }
 
 void DB::put(const std::string& key, const std::string& value) {
@@ -161,12 +256,17 @@ void DB::del(const std::string& key) {
 }
 
 std::optional<std::string> DB::get(const std::string& key) const {
-    std::shared_lock lock(mu_);
-    // Memtable holds the newest writes.
-    if (auto v = memtable_.get(key)) return v;
-    if (memtable_.is_tombstone(key)) return std::nullopt;  // deleted, stop here
-    // Then SSTables, newest to oldest. First match wins.
-    for (const auto& sst : sstables_) {
+    std::vector<std::shared_ptr<SSTable>> snapshot;
+    {
+        std::shared_lock lock(mu_);
+        // Memtable holds the newest writes.
+        if (auto v = memtable_.get(key)) return v;
+        if (memtable_.is_tombstone(key)) return std::nullopt;  // deleted, stop
+        snapshot = sstables_;  // copy the shared_ptrs, then read lock-free
+    }
+    // SSTables newest to oldest, first match wins. No lock held here, so
+    // compaction can run concurrently; the snapshot keeps these files alive.
+    for (const auto& sst : snapshot) {
         if (auto rec = sst->get(key)) {
             if (rec->op == Op::Delete) return std::nullopt;  // tombstone shadows
             return rec->value;
@@ -178,6 +278,11 @@ std::optional<std::string> DB::get(const std::string& key) const {
 void DB::flush() {
     std::unique_lock lock(mu_);
     flush_locked();
+}
+
+void DB::wait_for_idle() {
+    std::unique_lock lock(mu_);
+    cv_.wait(lock, [this] { return !compacting_ && !compaction_pending(); });
 }
 
 std::size_t DB::memtable_entry_count() const {

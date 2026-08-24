@@ -18,14 +18,19 @@ if(LSMKV_TSAN)
 endif()
 
 # --- core library -----------------------------------------------------------
+find_package(Threads REQUIRED)
+
 add_library(lsmkv
   src/memtable.cpp
   src/wal.cpp
   src/bloom_filter.cpp
   src/sstable.cpp
+  src/compaction.cpp
   src/db.cpp)
 target_include_directories(lsmkv PUBLIC include)
 target_compile_options(lsmkv PRIVATE -Wall -Wextra -Wpedantic)
+# DB runs a background compaction thread.
+target_link_libraries(lsmkv PUBLIC Threads::Threads)
 
 # --- tests ------------------------------------------------------------------
 enable_testing()
@@ -38,6 +43,10 @@ add_executable(unit_tests
   tests/bloom_filter_test.cpp
   tests/sstable_test.cpp
   tests/db_recovery_test.cpp
-  tests/db_sstable_test.cpp)
+  tests/db_sstable_test.cpp
+  tests/compaction_test.cpp)
 target_link_libraries(unit_tests PRIVATE lsmkv GTest::gtest GTest::gtest_main)
-gtest_discover_tests(unit_tests)
+# PRE_TEST defers enumeration to test time, so a sanitizer build does not run the
+# instrumented binary during the build (ThreadSanitizer needs ASLR disabled --
+# run it via: setarch -R ./build-tsan/unit_tests).
+gtest_discover_tests(unit_tests DISCOVERY_MODE PRE_TEST)

@@ -38,8 +38,19 @@ public:
     // nullopt if this SSTable does not contain the key.
     std::optional<Record> get(const std::string& key) const;
 
+    // Positional access in sorted key order, used by compaction's merge. The ith
+    // key and its full record; i must be < key_count().
+    const std::string& key_at(std::size_t i) const { return index_[i].key; }
+    Record record_at(std::size_t i) const;
+
     const std::string& path() const { return path_; }
     std::size_t key_count() const { return index_.size(); }
+    std::uint64_t size_bytes() const { return file_size_; }  // for size tiering
+
+    // Mark this SSTable's file for deletion. The file is unlinked when the last
+    // handle (this object) is destroyed -- so a reader still holding it via a
+    // snapshot keeps the file alive until it finishes.
+    void mark_obsolete() { obsolete_ = true; }
 
 private:
     struct IndexEntry {
@@ -49,7 +60,9 @@ private:
 
     std::string path_;
     int fd_ = -1;
-    std::uint64_t data_size_ = 0;  // end offset of the data block
+    std::uint64_t data_size_ = 0;   // end offset of the data block
+    std::uint64_t file_size_ = 0;   // whole file size, for size tiering
+    bool obsolete_ = false;         // if set, unlink the file on destruction
     std::vector<IndexEntry> index_;
     BloomFilter bloom_;
 };

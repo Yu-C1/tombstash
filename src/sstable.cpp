@@ -158,6 +158,7 @@ SSTable::SSTable(std::string path)
         throw std::runtime_error("SSTable: block sizes disagree with file: " + path_);
     }
     data_size_ = data_size;
+    file_size_ = file_size;
 
     // Load the dense index into memory (already sorted by key on disk).
     std::string idx = pread_exact(fd_, data_size, index_size);
@@ -181,6 +182,16 @@ SSTable::SSTable(std::string path)
 
 SSTable::~SSTable() {
     if (fd_ >= 0) ::close(fd_);
+    // Deleted only after the last handle is gone, so a reader holding this
+    // SSTable via a snapshot never has the file pulled out from under it.
+    if (obsolete_) ::unlink(path_.c_str());
+}
+
+Record SSTable::record_at(std::size_t i) const {
+    std::uint64_t start = index_[i].offset;
+    std::uint64_t end = (i + 1 < index_.size()) ? index_[i + 1].offset : data_size_;
+    std::string slice = pread_exact(fd_, start, static_cast<std::size_t>(end - start));
+    return parse_record(slice);
 }
 
 std::optional<Record> SSTable::get(const std::string& key) const {
@@ -193,11 +204,7 @@ std::optional<Record> SSTable::get(const std::string& key) const {
     if (it == index_.end() || it->key != key) {
         return std::nullopt;  // Bloom false positive: key not really here
     }
-    std::size_t i = static_cast<std::size_t>(it - index_.begin());
-    std::uint64_t start = it->offset;
-    std::uint64_t end = (i + 1 < index_.size()) ? index_[i + 1].offset : data_size_;
-    std::string slice = pread_exact(fd_, start, static_cast<std::size_t>(end - start));
-    return parse_record(slice);
+    return record_at(static_cast<std::size_t>(it - index_.begin()));
 }
 
 }  // namespace lsmkv
