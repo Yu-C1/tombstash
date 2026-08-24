@@ -64,7 +64,7 @@ void Wal::close_fd() noexcept {
     }
 }
 
-void Wal::append(const Record& rec) {
+void Wal::append(const Record& rec, bool sync) {
     if (rec.key.size() > UINT32_MAX || rec.value.size() > UINT32_MAX) {
         throw std::length_error("WAL record field exceeds 4 GiB");
     }
@@ -78,6 +78,11 @@ void Wal::append(const Record& rec) {
 
     write_all(fd_, buf.data(), buf.size());
     // fsync makes the appended bytes durable before the caller sees success.
+    // Skipped when the caller is batching writes and will sync() later.
+    if (sync) this->sync();
+}
+
+void Wal::sync() {
     if (::fsync(fd_) != 0) {
         throw std::system_error(errno, std::generic_category(), "WAL fsync");
     }

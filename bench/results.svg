@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="352" font-family="sans-serif">
+<text x="20" y="32" font-size="20" font-weight="bold">tombstash throughput (ops/sec)</text>
+<text x="20" y="76" font-size="14">seq writes (group commit)</text>
+<rect x="250" y="60" width="94" height="24" rx="3" fill="#3b82f6"/>
+<text x="352" y="76" font-size="14">191484</text>
+<text x="20" y="122" font-size="14">seq writes (fsync/write)</text>
+<rect x="250" y="106" width="1" height="24" rx="3" fill="#3b82f6"/>
+<text x="259" y="122" font-size="14">401</text>
+<text x="20" y="168" font-size="14">present reads (Bloom on)</text>
+<rect x="250" y="152" width="132" height="24" rx="3" fill="#3b82f6"/>
+<text x="390" y="168" font-size="14">266652</text>
+<text x="20" y="214" font-size="14">present reads (Bloom off)</text>
+<rect x="250" y="198" width="143" height="24" rx="3" fill="#3b82f6"/>
+<text x="401" y="214" font-size="14">290369</text>
+<text x="20" y="260" font-size="14">missing reads (Bloom on)</text>
+<rect x="250" y="244" width="400" height="24" rx="3" fill="#3b82f6"/>
+<text x="658" y="260" font-size="14">807293</text>
+<text x="20" y="306" font-size="14">missing reads (Bloom off)</text>
+<rect x="250" y="290" width="320" height="24" rx="3" fill="#3b82f6"/>
+<text x="578" y="306" font-size="14">646523</text>
+</svg>

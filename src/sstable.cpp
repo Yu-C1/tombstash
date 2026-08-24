@@ -84,7 +84,8 @@ Record parse_record(const std::string& s) {
 
 }  // namespace
 
-void SSTable::build(const std::string& path, const std::vector<Record>& sorted) {
+std::uint64_t SSTable::build(const std::string& path,
+                             const std::vector<Record>& sorted) {
     BloomFilter bloom(sorted.empty() ? 1 : sorted.size(), 0.01);
     std::string data;
     std::string index;
@@ -120,6 +121,7 @@ void SSTable::build(const std::string& path, const std::vector<Record>& sorted) 
     file += bloom_bytes;
     file += footer;
     write_file_sync(path, file);
+    return file.size();
 }
 
 SSTable::SSTable(std::string path)
@@ -194,17 +196,25 @@ Record SSTable::record_at(std::size_t i) const {
     return parse_record(slice);
 }
 
-std::optional<Record> SSTable::get(const std::string& key) const {
-    if (!bloom_.maybe_contains(key)) {
-        return std::nullopt;  // Bloom proves absence: skip the file entirely
-    }
+bool SSTable::may_contain(const std::string& key) const {
+    return bloom_.maybe_contains(key);
+}
+
+std::optional<Record> SSTable::get_no_bloom(const std::string& key) const {
     auto it = std::lower_bound(
         index_.begin(), index_.end(), key,
         [](const IndexEntry& e, const std::string& k) { return e.key < k; });
     if (it == index_.end() || it->key != key) {
-        return std::nullopt;  // Bloom false positive: key not really here
+        return std::nullopt;
     }
     return record_at(static_cast<std::size_t>(it - index_.begin()));
+}
+
+std::optional<Record> SSTable::get(const std::string& key) const {
+    if (!may_contain(key)) {
+        return std::nullopt;  // Bloom proves absence: skip the file entirely
+    }
+    return get_no_bloom(key);
 }
 
 }  // namespace lsmkv

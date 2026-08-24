@@ -25,8 +25,14 @@ public:
     Wal(Wal&&) noexcept;
     Wal& operator=(Wal&&) noexcept;
 
-    // Append one record and fsync so it is durable before returning.
-    void append(const Record& rec);
+    // Append one record. If sync is true (default), fsync before returning so
+    // the write is durable. If false, the bytes are handed to the OS but not
+    // forced to disk until a later sync() -- the basis for group commit, which
+    // amortizes one fsync over many writes.
+    void append(const Record& rec, bool sync = true);
+
+    // fsync the log, making all prior appends durable.
+    void sync();
 
     // Read every complete record from the log at path, in write order. A partial
     // trailing record (a torn write from a crash) is ignored: it was never

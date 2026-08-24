@@ -23,8 +23,10 @@ namespace lsmkv {
 class SSTable {
 public:
     // Write records (which MUST be sorted ascending by key, tombstones included)
-    // to path as a new SSTable, fsync'd before returning.
-    static void build(const std::string& path, const std::vector<Record>& sorted);
+    // to path as a new SSTable, fsync'd before returning. Returns the number of
+    // bytes written, for write-amplification accounting.
+    static std::uint64_t build(const std::string& path,
+                               const std::vector<Record>& sorted);
 
     // Open an existing SSTable, loading its index and Bloom filter into memory.
     // The file stays open for positioned reads.
@@ -35,8 +37,17 @@ public:
     SSTable& operator=(const SSTable&) = delete;
 
     // The stored record for key (op distinguishes a value from a tombstone), or
-    // nullopt if this SSTable does not contain the key.
+    // nullopt if this SSTable does not contain the key. Consults the Bloom filter
+    // first. Equivalent to: may_contain(key) ? get_no_bloom(key) : nullopt.
     std::optional<Record> get(const std::string& key) const;
+
+    // The Bloom filter's answer alone: false means the key is definitely absent.
+    // Split out so the DB can count filter hits and toggle the filter off for
+    // benchmarking its effect.
+    bool may_contain(const std::string& key) const;
+
+    // Look the key up in the index without consulting the Bloom filter.
+    std::optional<Record> get_no_bloom(const std::string& key) const;
 
     // Positional access in sorted key order, used by compaction's merge. The ith
     // key and its full record; i must be < key_count().

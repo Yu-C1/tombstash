@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -25,21 +26,26 @@ namespace lsmkv {
 // tombstones. Reads take a snapshot of the SSTable list (a copy of the
 // shared_ptrs) and read without holding a lock, so reads never block compaction
 // and compaction never deletes a file out from under a reader.
-//
-// Concurrency (spec section 4): a single std::shared_mutex. Reads take it shared
-// only long enough to copy the snapshot; writes, flushes, and the compaction
-// list-swap take it exclusive. The slow part of compaction (merge + file write)
-// runs with no lock held.
 class DB {
 public:
     static constexpr std::size_t kDefaultThreshold = 4u * 1024 * 1024;  // 4 MiB
     static constexpr std::size_t kDefaultMinMerge = 4;
     static constexpr double kDefaultSizeRatio = 2.0;
 
-    // Open the database rooted at dir (created if missing).
-    // memtable_threshold: byte size at which the memtable flushes.
-    // min_merge: number of similar-size SSTables that triggers a compaction.
-    // size_ratio: size factor separating tiers.
+    // Cumulative counters, for benchmarking and (later) the stats dashboard.
+    struct Stats {
+        std::uint64_t user_bytes = 0;         // key+value bytes the caller wrote
+        std::uint64_t wal_bytes = 0;          // bytes appended to the WAL
+        std::uint64_t flush_bytes = 0;        // bytes written by memtable flushes
+        std::uint64_t compaction_bytes = 0;   // bytes written by compaction merges
+        std::uint64_t writes = 0;
+        std::uint64_t deletes = 0;
+        std::uint64_t reads = 0;
+        std::uint64_t bloom_checks = 0;           // Bloom filters consulted
+        std::uint64_t bloom_skips = 0;            // filters that ruled a key out
+        std::uint64_t bloom_false_positives = 0;  // filter said maybe, key absent
+    };
+
     explicit DB(const std::string& dir,
                 std::size_t memtable_threshold = kDefaultThreshold,
                 std::size_t min_merge = kDefaultMinMerge,
@@ -49,25 +55,42 @@ public:
     DB(const DB&) = delete;
     DB& operator=(const DB&) = delete;
 
-    void put(const std::string& key, const std::string& value);
-    void del(const std::string& key);
+    // sync=true (default) fsyncs the WAL before returning (durable on return).
+    // sync=false batches the write; call sync() to make a batch durable.
+    void put(const std::string& key, const std::string& value, bool sync = true);
+    void del(const std::string& key, bool sync = true);
     std::optional<std::string> get(const std::string& key) const;
+
+    // fsync the WAL, making all preceding unsynced writes durable (group commit).
+    void sync();
 
     // Force the current memtable to disk as an SSTable, even if under threshold.
     void flush();
 
-    // Block until no compaction is running and none is pending. For deterministic
-    // tests; not needed in normal use.
+    // Merge every SSTable into one (a major compaction). Synchronous; used for
+    // benchmarks and to reclaim space on demand.
+    void compact_all();
+
+    // Turn the Bloom-filter read optimization on or off (to benchmark its value).
+    void set_bloom_enabled(bool on);
+
+    // Block until no compaction is running and none is pending.
     void wait_for_idle();
 
     std::size_t memtable_entry_count() const;
     std::size_t sstable_count() const;
+    std::uint64_t disk_bytes() const;  // total size of all SSTable files
+    Stats stats() const;
 
 private:
     void flush_locked();          // caller holds the exclusive lock
     void load_sstables();         // called once from the constructor
     void compaction_loop();       // body of the background thread
     bool compaction_pending() const;  // caller holds the lock
+    // Replace inputs (matched by identity) with output at the newest input's age
+    // slot, marking the replaced files obsolete. Caller holds the exclusive lock.
+    void install_merge_result(const std::vector<std::shared_ptr<SSTable>>& inputs,
+                              std::shared_ptr<SSTable> output);
 
     std::string dir_;
     std::string wal_path_;
@@ -77,16 +100,28 @@ private:
 
     Wal wal_;
     Memtable memtable_;
-    // Newest first: sstables_.front() is the most recently flushed.
-    std::vector<std::shared_ptr<SSTable>> sstables_;
+    std::vector<std::shared_ptr<SSTable>> sstables_;  // newest first
     std::uint64_t next_seq_ = 0;
+    bool bloom_enabled_ = true;
 
     mutable std::shared_mutex mu_;
-    // condition_variable_any because we wait on a shared_mutex, not a plain mutex.
     std::condition_variable_any cv_;
-    bool stop_ = false;        // set in the destructor to end the thread
-    bool compacting_ = false;  // true while a merge is in flight
+    bool stop_ = false;
+    bool compacting_ = false;
     std::thread compactor_;
+
+    // Stats counters. Atomic so reads/compaction can bump them without the lock;
+    // mutable because get() is const but still counts Bloom activity.
+    mutable std::atomic<std::uint64_t> stat_user_bytes_{0};
+    mutable std::atomic<std::uint64_t> stat_wal_bytes_{0};
+    mutable std::atomic<std::uint64_t> stat_flush_bytes_{0};
+    mutable std::atomic<std::uint64_t> stat_compaction_bytes_{0};
+    mutable std::atomic<std::uint64_t> stat_writes_{0};
+    mutable std::atomic<std::uint64_t> stat_deletes_{0};
+    mutable std::atomic<std::uint64_t> stat_reads_{0};
+    mutable std::atomic<std::uint64_t> stat_bloom_checks_{0};
+    mutable std::atomic<std::uint64_t> stat_bloom_skips_{0};
+    mutable std::atomic<std::uint64_t> stat_bloom_fps_{0};
 };
 
 }  // namespace lsmkv
