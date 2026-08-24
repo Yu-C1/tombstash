@@ -60,18 +60,19 @@ std::optional<CompactionPick> pick_compaction(
 std::vector<Record> merge_records(
     const std::vector<std::shared_ptr<SSTable>>& inputs, bool drop_tombstones) {
     const std::size_t n = inputs.size();
-    std::vector<std::size_t> cursor(n, 0);
+    // One streaming cursor per input; each reads its SSTable one block at a time.
+    std::vector<SSTable::Iterator> cursor;
+    cursor.reserve(n);
+    for (const auto& in : inputs) cursor.push_back(in->iterator());
     std::vector<Record> out;
-
-    auto valid = [&](std::size_t j) { return cursor[j] < inputs[j]->key_count(); };
 
     for (;;) {
         // Smallest key currently under any cursor.
         bool any = false;
         std::string min_key;
         for (std::size_t j = 0; j < n; ++j) {
-            if (!valid(j)) continue;
-            const std::string& k = inputs[j]->key_at(cursor[j]);
+            if (!cursor[j].valid()) continue;
+            const std::string& k = cursor[j].key();
             if (!any || k < min_key) {
                 min_key = k;
                 any = true;
@@ -83,16 +84,16 @@ std::vector<Record> merge_records(
         // newest copy -- that record wins.
         std::size_t newest = std::numeric_limits<std::size_t>::max();
         for (std::size_t j = 0; j < n; ++j) {
-            if (valid(j) && inputs[j]->key_at(cursor[j]) == min_key) {
+            if (cursor[j].valid() && cursor[j].key() == min_key) {
                 newest = j;
                 break;
             }
         }
-        Record rec = inputs[newest]->record_at(cursor[newest]);
+        Record rec = cursor[newest].record();
 
         // Consume this key from every input (drop the shadowed older copies).
         for (std::size_t j = 0; j < n; ++j) {
-            if (valid(j) && inputs[j]->key_at(cursor[j]) == min_key) ++cursor[j];
+            if (cursor[j].valid() && cursor[j].key() == min_key) cursor[j].next();
         }
 
         if (!(drop_tombstones && rec.op == Op::Delete)) {

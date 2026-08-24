@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -9,72 +10,96 @@
 
 namespace lsmkv {
 
-// A sorted, immutable on-disk file created when a memtable flushes. Never
-// modified after writing.
+// A sorted, immutable on-disk file created when a memtable flushes.
 //
-// File layout (see spec section 8):
-//   [data block ]  sorted records: [op:1][klen:4][key][vlen:4][val]
-//   [index block]  one entry per record: [klen:4][key][offset:8]
-//   [bloom block]  serialized Bloom filter
-//   [footer     ]  [data_size:8][index_size:8][bloom_size:8][magic:8]
+// Records are grouped into ~4 KiB data blocks. The index is SPARSE: one entry
+// per block (its first key + the block's byte offset and length), not one entry
+// per key. This keeps the in-memory index small enough to scale to far more keys
+// than a dense per-key index would -- at the cost of reading and scanning a whole
+// block per lookup. A per-SSTable Bloom filter lets a read skip the block read
+// entirely for keys the file does not contain.
 //
-// The index is dense (one entry per key), so a lookup is a single binary search
-// plus one positioned read of the record.
+// File layout:
+//   [data region ]  concatenated blocks; each block is sorted records
+//                   [op:1][klen:4][key][vlen:4][val] ...
+//   [index block ]  one entry per block: [klen:4][first_key][offset:8][length:8]
+//   [bloom block ]  serialized Bloom filter
+//   [footer      ]  [data_size:8][index_size:8][bloom_size:8][num_records:8][magic:8]
 class SSTable {
 public:
+    // ~4 KiB target block size (a block may exceed it by one record).
+    static constexpr std::size_t kBlockSize = 4096;
+
+    // Process-wide count of data-block reads (one disk read each on a cold cache).
+    // A benchmarking instrument: it makes the Bloom filter's savings visible
+    // independent of the page cache. Not part of normal operation.
+    static std::uint64_t block_reads();
+    static void reset_block_reads();
+
     // Write records (which MUST be sorted ascending by key, tombstones included)
-    // to path as a new SSTable, fsync'd before returning. Returns the number of
-    // bytes written, for write-amplification accounting.
+    // to path as a new SSTable, fsync'd before returning. Returns bytes written.
     static std::uint64_t build(const std::string& path,
                                const std::vector<Record>& sorted);
 
-    // Open an existing SSTable, loading its index and Bloom filter into memory.
-    // The file stays open for positioned reads.
     explicit SSTable(std::string path);
     ~SSTable();
 
     SSTable(const SSTable&) = delete;
     SSTable& operator=(const SSTable&) = delete;
 
-    // The stored record for key (op distinguishes a value from a tombstone), or
-    // nullopt if this SSTable does not contain the key. Consults the Bloom filter
-    // first. Equivalent to: may_contain(key) ? get_no_bloom(key) : nullopt.
+    // The stored record for key, or nullopt if absent. Bloom filter first, then
+    // sparse-index binary search to the one candidate block, then scan the block.
     std::optional<Record> get(const std::string& key) const;
 
-    // The Bloom filter's answer alone: false means the key is definitely absent.
-    // Split out so the DB can count filter hits and toggle the filter off for
-    // benchmarking its effect.
+    // The Bloom filter's answer alone: false means definitely absent.
     bool may_contain(const std::string& key) const;
 
-    // Look the key up in the index without consulting the Bloom filter.
+    // Sparse-index lookup + block scan, without consulting the Bloom filter.
     std::optional<Record> get_no_bloom(const std::string& key) const;
 
-    // Positional access in sorted key order, used by compaction's merge. The ith
-    // key and its full record; i must be < key_count().
-    const std::string& key_at(std::size_t i) const { return index_[i].key; }
-    Record record_at(std::size_t i) const;
-
     const std::string& path() const { return path_; }
-    std::size_t key_count() const { return index_.size(); }
-    std::uint64_t size_bytes() const { return file_size_; }  // for size tiering
-
-    // Mark this SSTable's file for deletion. The file is unlinked when the last
-    // handle (this object) is destroyed -- so a reader still holding it via a
-    // snapshot keeps the file alive until it finishes.
+    std::size_t key_count() const { return num_records_; }
+    std::size_t block_count() const { return index_.size(); }
+    std::uint64_t size_bytes() const { return file_size_; }
     void mark_obsolete() { obsolete_ = true; }
+
+    // Forward cursor over every record in key order, reading one block at a time.
+    // Used by compaction's k-way merge.
+    class Iterator {
+    public:
+        explicit Iterator(const SSTable* sst);
+        bool valid() const;
+        const std::string& key() const { return block_[pos_].key; }
+        const Record& record() const { return block_[pos_]; }
+        void next();
+
+    private:
+        void load_block(std::size_t i);
+        const SSTable* sst_;
+        std::size_t block_idx_ = 0;
+        std::size_t pos_ = 0;
+        std::vector<Record> block_;
+    };
+
+    Iterator iterator() const { return Iterator(this); }
 
 private:
     struct IndexEntry {
-        std::string key;
-        std::uint64_t offset;  // byte offset of the record in the data block
+        std::string first_key;  // smallest key in the block
+        std::uint64_t offset;   // byte offset of the block in the data region
+        std::uint64_t length;   // block size in bytes
     };
+
+    // Read block i off disk and parse its records (sorted, key order).
+    std::vector<Record> read_block_records(std::size_t i) const;
 
     std::string path_;
     int fd_ = -1;
-    std::uint64_t data_size_ = 0;   // end offset of the data block
-    std::uint64_t file_size_ = 0;   // whole file size, for size tiering
-    bool obsolete_ = false;         // if set, unlink the file on destruction
-    std::vector<IndexEntry> index_;
+    std::uint64_t data_size_ = 0;
+    std::uint64_t file_size_ = 0;
+    std::uint64_t num_records_ = 0;
+    bool obsolete_ = false;
+    std::vector<IndexEntry> index_;  // one entry per block, sorted by first_key
     BloomFilter bloom_;
 };
 

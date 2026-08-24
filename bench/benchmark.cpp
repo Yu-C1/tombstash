@@ -16,8 +16,10 @@
 #include <vector>
 
 #include "lsmkv/db.h"
+#include "lsmkv/sstable.h"
 
 namespace fs = std::filesystem;
+using lsmkv::SSTable;
 using lsmkv::DB;
 using Clock = std::chrono::steady_clock;
 
@@ -134,33 +136,40 @@ int main(int argc, char** argv) {
     const int reads = std::min(n, 200'000);
     std::vector<int> order = shuffled_indices(n);
     db.set_bloom_enabled(true);
-    auto snap0 = db.stats();
+    SSTable::reset_block_reads();
     t0 = Clock::now();
     std::uint64_t found = 0;
     for (int i = 0; i < reads; ++i) {
         if (db.get(key_of(order[i])).has_value()) ++found;
     }
     double read_bloom_on = per_sec(reads, seconds_since(t0));
+    std::uint64_t blk_present_on = SSTable::block_reads();
 
     // --- Phase 4: same reads, Bloom OFF --------------------------------------
     db.set_bloom_enabled(false);
+    SSTable::reset_block_reads();
     t0 = Clock::now();
     for (int i = 0; i < reads; ++i) (void)db.get(key_of(order[i]));
     double read_bloom_off = per_sec(reads, seconds_since(t0));
+    std::uint64_t blk_present_off = SSTable::block_reads();
 
     // --- Phase 5: missing-key reads, Bloom ON (where the filter earns its keep)
     db.set_bloom_enabled(true);
     auto snap_miss0 = db.stats();
+    SSTable::reset_block_reads();
     t0 = Clock::now();
     for (int i = 0; i < reads; ++i) (void)db.get("missing" + std::to_string(i));
     double read_missing = per_sec(reads, seconds_since(t0));
+    std::uint64_t blk_missing_on = SSTable::block_reads();
     auto snap_miss1 = db.stats();
 
-    // --- Phase 5b: missing-key reads, Bloom OFF (binary-search every table) --
+    // --- Phase 5b: missing-key reads, Bloom OFF (read a block in every table) -
     db.set_bloom_enabled(false);
+    SSTable::reset_block_reads();
     t0 = Clock::now();
     for (int i = 0; i < reads; ++i) (void)db.get("missing" + std::to_string(i));
     double read_missing_off = per_sec(reads, seconds_since(t0));
+    std::uint64_t blk_missing_off = SSTable::block_reads();
     db.set_bloom_enabled(true);
 
     // --- Phase 6: disk usage before/after a full compaction ------------------
@@ -180,7 +189,6 @@ int main(int argc, char** argv) {
                                              snap_miss0.bloom_checks);
     double miss_skips = static_cast<double>(snap_miss1.bloom_skips -
                                             snap_miss0.bloom_skips);
-    (void)snap0;
     (void)found;
 
     std::printf("== Throughput ==\n");
@@ -192,6 +200,22 @@ int main(int argc, char** argv) {
     std::printf("  missing-key reads, Bloom OFF     : %12.0f ops/sec\n", read_missing_off);
     std::printf("  Bloom speedup on missing keys    : %12.1fx\n",
                 read_missing_off > 0 ? read_missing / read_missing_off : 0.0);
+
+    // The real payoff of the sparse index + Bloom: each avoided block read is a
+    // disk read on a cold cache. This count is cache-independent.
+    std::printf("\n== Data-block reads (%d reads each; lower = Bloom skipped more) ==\n",
+                reads);
+    std::printf("  present keys, Bloom ON           : %12llu\n",
+                (unsigned long long)blk_present_on);
+    std::printf("  present keys, Bloom OFF          : %12llu\n",
+                (unsigned long long)blk_present_off);
+    std::printf("  missing keys, Bloom ON           : %12llu\n",
+                (unsigned long long)blk_missing_on);
+    std::printf("  missing keys, Bloom OFF          : %12llu\n",
+                (unsigned long long)blk_missing_off);
+    std::printf("  block reads Bloom eliminated (missing): %llu -> %llu\n",
+                (unsigned long long)blk_missing_off,
+                (unsigned long long)blk_missing_on);
 
     std::printf("\n== Space ==\n");
     std::printf("  SSTables before compaction       : %zu (%.1f MiB)\n",
