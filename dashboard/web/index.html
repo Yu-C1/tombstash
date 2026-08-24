@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tombstash dashboard</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #182031; --ink: #e6ecf5; --muted: #8ea0bd;
+    --line: #263349; --accent: #3b82f6; --green: #34d399; --amber: #fbbf24;
+    --red: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 16px 24px; border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: .3px; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  .runbar { margin-left: auto; display: flex; gap: 10px; align-items: center; }
+  button {
+    background: var(--accent); color: white; border: 0;
+    padding: 9px 16px; border-radius: 8px; font-weight: 600; cursor: pointer;
+  }
+  button.alt { background: #2b3a52; }
+  button:hover { filter: brightness(1.12); }
+  button:disabled { opacity: .45; cursor: default; filter: none; }
+  .status { color: var(--muted); font-size: 13px; min-width: 150px; }
+  .status.live { color: var(--green); }
+  main { padding: 20px 24px; display: grid; gap: 20px;
+         grid-template-columns: 1fr 1fr; max-width: 1100px; }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 12px; padding: 16px; }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .8px;
+              color: var(--muted); margin: 0 0 12px; }
+  .wide { grid-column: 1 / -1; }
+  /* memtable bar */
+  .bar { height: 26px; background: #0d1422; border-radius: 6px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: linear-gradient(90deg,#2563eb,#60a5fa);
+               transition: width .25s ease; }
+  .bar-label { display:flex; justify-content: space-between; margin-top: 8px;
+               color: var(--muted); font-size: 13px; }
+  /* sstable tiers */
+  .tier { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .tier .name { width: 28px; color: var(--muted); font-weight: 600; }
+  .tier .boxes { display: flex; gap: 6px; flex-wrap: wrap; }
+  .sst { background: #1e3a5f; border: 1px solid #315b8a;
+         border-radius: 6px; padding: 6px 8px; min-width: 44px;
+         transition: width .3s ease; }
+  .sst .n { font-weight: 600; font-size: 13px; }
+  .sst .r { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  /* stat grid */
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 20px; }
+  .stat { display: flex; justify-content: space-between; border-bottom: 1px dashed var(--line);
+          padding-bottom: 6px; }
+  .stat .k { color: var(--muted); }
+  .stat .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+  canvas { width: 100%; height: 70px; display: block; }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .chart h3 { margin: 0 0 4px; font-size: 13px; color: var(--muted); font-weight: 500; }
+  .legend { font-size: 12px; color: var(--muted); margin-top: 2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tombstash</h1>
+  <span class="sub">LSM-tree key-value store &middot; live internals</span>
+  <div class="runbar">
+    <button id="run-sync" class="alt" title="one fsync per write (durable, slow)">Run: fsync / write</button>
+    <button id="run-group" title="one fsync per batch (fast)">Run: group commit</button>
+    <span class="status" id="status">idle</span>
+  </div>
+</header>
+<main>
+  <section class="panel wide">
+    <h2>SSTables by tier &mdash; watch flushes appear, compaction merge them</h2>
+    <div id="tiers"></div>
+    <div id="tiers-empty" class="bar-label">No SSTables yet. Click &ldquo;Run workload&rdquo;.</div>
+  </section>
+
+  <section class="panel">
+    <h2>Memtable</h2>
+    <div class="bar"><div id="mem-fill"></div></div>
+    <div class="bar-label"><span id="mem-left">0 entries</span><span id="mem-right">0 / 0 KiB</span></div>
+  </section>
+
+  <section class="panel">
+    <h2>Throughput</h2>
+    <div class="charts">
+      <div class="chart"><h3>writes/sec</h3><canvas id="c-write"></canvas>
+        <div class="legend" id="l-write">0</div></div>
+      <div class="chart"><h3>reads/sec</h3><canvas id="c-read"></canvas>
+        <div class="legend" id="l-read">0</div></div>
+    </div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Counters</h2>
+    <div class="grid">
+      <div class="stat"><span class="k">writes</span><span class="v" id="s-writes">0</span></div>
+      <div class="stat"><span class="k">reads</span><span class="v" id="s-reads">0</span></div>
+      <div class="stat"><span class="k">deletes</span><span class="v" id="s-deletes">0</span></div>
+      <div class="stat"><span class="k">compactions</span><span class="v" id="s-compactions">0</span></div>
+      <div class="stat"><span class="k">tombstones (memtable)</span><span class="v" id="s-tomb">0</span></div>
+      <div class="stat"><span class="k">disk used</span><span class="v" id="s-disk">0</span></div>
+      <div class="stat"><span class="k">bloom skip rate</span><span class="v" id="s-bloom">&mdash;</span></div>
+      <div class="stat"><span class="k">write amplification</span><span class="v" id="s-wa">&mdash;</span></div>
+    </div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

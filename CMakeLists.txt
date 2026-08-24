@@ -59,3 +59,7 @@ target_link_libraries(benchmark PRIVATE lsmkv)
 add_executable(lsmkv_cli cli/main.cpp)
 set_target_properties(lsmkv_cli PROPERTIES OUTPUT_NAME lsmkv)
 target_link_libraries(lsmkv_cli PRIVATE lsmkv)
+
+# --- observability dashboard (optional layer) -------------------------------
+add_executable(stats_server dashboard/stats_server.cpp)
+target_link_libraries(stats_server PRIVATE lsmkv)

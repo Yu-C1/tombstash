@@ -47,6 +47,14 @@ bool Memtable::is_tombstone(const std::string& key) const {
     return it != entries_.end() && it->second.tombstone;
 }
 
+std::size_t Memtable::tombstone_count() const {
+    std::size_t n = 0;
+    for (const auto& [key, entry] : entries_) {
+        if (entry.tombstone) ++n;
+    }
+    return n;
+}
+
 std::vector<Record> Memtable::snapshot() const {
     std::vector<Record> out;
     out.reserve(entries_.size());

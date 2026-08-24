@@ -34,6 +34,9 @@ public:
 
     std::size_t entry_count() const { return entries_.size(); }
 
+    // Number of entries currently held as tombstones (awaiting collection).
+    std::size_t tombstone_count() const;
+
     // Approximate in-memory byte size of all keys and values held. Drives the
     // flush threshold in later weeks.
     std::size_t size_bytes() const { return size_bytes_; }

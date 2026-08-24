@@ -44,6 +44,16 @@ public:
         std::uint64_t bloom_checks = 0;           // Bloom filters consulted
         std::uint64_t bloom_skips = 0;            // filters that ruled a key out
         std::uint64_t bloom_false_positives = 0;  // filter said maybe, key absent
+        std::uint64_t compactions = 0;            // merges completed
+    };
+
+    // A snapshot of one SSTable's shape, for the dashboard's layout view.
+    struct SSTableInfo {
+        std::uint64_t size_bytes = 0;
+        std::uint64_t records = 0;
+        std::string min_key;
+        std::string max_key;
+        int tier = 0;  // size bucket (bigger = merged further)
     };
 
     explicit DB(const std::string& dir,
@@ -78,8 +88,12 @@ public:
     void wait_for_idle();
 
     std::size_t memtable_entry_count() const;
+    std::size_t memtable_bytes() const;        // current memtable byte size
+    std::size_t memtable_tombstones() const;   // tombstones awaiting collection
+    std::size_t threshold() const { return threshold_; }  // flush threshold
     std::size_t sstable_count() const;
     std::uint64_t disk_bytes() const;  // total size of all SSTable files
+    std::vector<SSTableInfo> sstable_infos() const;  // newest first
     Stats stats() const;
 
 private:
@@ -122,6 +136,7 @@ private:
     mutable std::atomic<std::uint64_t> stat_bloom_checks_{0};
     mutable std::atomic<std::uint64_t> stat_bloom_skips_{0};
     mutable std::atomic<std::uint64_t> stat_bloom_fps_{0};
+    mutable std::atomic<std::uint64_t> stat_compactions_{0};
 };
 
 }  // namespace lsmkv

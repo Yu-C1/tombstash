@@ -208,6 +208,13 @@ SSTable::SSTable(std::string path) : path_(std::move(path)), bloom_(1, 0.01) {
         index_.push_back(std::move(e));
     }
 
+    // Cache the key range for the dashboard's SSTable-layout view.
+    if (!index_.empty()) {
+        min_key_ = index_.front().first_key;
+        std::vector<Record> last = read_block_records(index_.size() - 1);
+        if (!last.empty()) max_key_ = last.back().key;
+    }
+
     std::string bloom_bytes = pread_exact(fd_, data_size + index_size, bloom_size);
     bloom_ = BloomFilter::deserialize(bloom_bytes);
 }
@@ -221,8 +228,10 @@ std::uint64_t SSTable::block_reads() { return g_block_reads.load(); }
 void SSTable::reset_block_reads() { g_block_reads.store(0); }
 
 std::vector<Record> SSTable::read_block_records(std::size_t i) const {
+    // Counter is bumped by the callers that represent a real query read
+    // (get_no_bloom, Iterator::load_block), not here, so opening a table to read
+    // its key range does not inflate the benchmark count.
     const IndexEntry& e = index_[i];
-    g_block_reads.fetch_add(1, std::memory_order_relaxed);  // one data-block read
     std::string bytes = pread_exact(fd_, e.offset, static_cast<std::size_t>(e.length));
     std::vector<Record> recs;
     std::size_t p = 0;
@@ -246,6 +255,7 @@ std::optional<Record> SSTable::get_no_bloom(const std::string& key) const {
         [](const std::string& k, const IndexEntry& e) { return k < e.first_key; });
     if (it == index_.begin()) return std::nullopt;  // key precedes the first block
     --it;
+    g_block_reads.fetch_add(1, std::memory_order_relaxed);  // a real query block read
     std::vector<Record> recs = read_block_records(
         static_cast<std::size_t>(it - index_.begin()));
     for (const Record& r : recs) {
@@ -266,6 +276,7 @@ SSTable::Iterator::Iterator(const SSTable* sst) : sst_(sst) {
 
 void SSTable::Iterator::load_block(std::size_t i) {
     block_idx_ = i;
+    g_block_reads.fetch_add(1, std::memory_order_relaxed);  // a real block read
     block_ = sst_->read_block_records(i);
     pos_ = 0;
 }

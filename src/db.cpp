@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -217,6 +218,7 @@ void DB::compaction_loop() {
         {
             std::unique_lock lock(mu_);
             stat_compaction_bytes_ += bytes;
+            stat_compactions_ += 1;
             install_merge_result(inputs, output);
             compacting_ = false;
             inputs.clear();  // let obsolete files unlink once readers release them
@@ -311,6 +313,7 @@ void DB::compact_all() {
     {
         std::unique_lock lock(mu_);
         stat_compaction_bytes_ += bytes;
+        stat_compactions_ += 1;
         install_merge_result(inputs, output);
         compacting_ = false;
         inputs.clear();
@@ -333,6 +336,16 @@ std::size_t DB::memtable_entry_count() const {
     return memtable_.entry_count();
 }
 
+std::size_t DB::memtable_bytes() const {
+    std::shared_lock lock(mu_);
+    return memtable_.size_bytes();
+}
+
+std::size_t DB::memtable_tombstones() const {
+    std::shared_lock lock(mu_);
+    return memtable_.tombstone_count();
+}
+
 std::size_t DB::sstable_count() const {
     std::shared_lock lock(mu_);
     return sstables_.size();
@@ -343,6 +356,23 @@ std::uint64_t DB::disk_bytes() const {
     std::uint64_t total = 0;
     for (const auto& t : sstables_) total += t->size_bytes();
     return total;
+}
+
+std::vector<DB::SSTableInfo> DB::sstable_infos() const {
+    std::shared_lock lock(mu_);
+    std::vector<SSTableInfo> out;
+    out.reserve(sstables_.size());
+    for (const auto& t : sstables_) {
+        SSTableInfo info;
+        info.size_bytes = t->size_bytes();
+        info.records = t->key_count();
+        info.min_key = t->min_key();
+        info.max_key = t->max_key();
+        double s = static_cast<double>(std::max<std::uint64_t>(t->size_bytes(), 1));
+        info.tier = static_cast<int>(std::floor(std::log(s) / std::log(size_ratio_)));
+        out.push_back(std::move(info));
+    }
+    return out;
 }
 
 DB::Stats DB::stats() const {
@@ -357,6 +387,7 @@ DB::Stats DB::stats() const {
     s.bloom_checks = stat_bloom_checks_.load();
     s.bloom_skips = stat_bloom_skips_.load();
     s.bloom_false_positives = stat_bloom_fps_.load();
+    s.compactions = stat_compactions_.load();
     return s;
 }
 

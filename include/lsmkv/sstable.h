@@ -61,6 +61,8 @@ public:
     std::size_t key_count() const { return num_records_; }
     std::size_t block_count() const { return index_.size(); }
     std::uint64_t size_bytes() const { return file_size_; }
+    const std::string& min_key() const { return min_key_; }  // smallest key in file
+    const std::string& max_key() const { return max_key_; }  // largest key in file
     void mark_obsolete() { obsolete_ = true; }
 
     // Forward cursor over every record in key order, reading one block at a time.
@@ -99,6 +101,8 @@ private:
     std::uint64_t file_size_ = 0;
     std::uint64_t num_records_ = 0;
     bool obsolete_ = false;
+    std::string min_key_;
+    std::string max_key_;
     std::vector<IndexEntry> index_;  // one entry per block, sorted by first_key
     BloomFilter bloom_;
 };

@@ -85,6 +85,18 @@ cmake --build build-release -j
 ./build-release/benchmark 1000000 bench/results.svg
 ```
 
+Observability dashboard — a live view of the engine's internals in the browser:
+
+```bash
+./build/stats_server 8080 dashboard/web
+# open http://localhost:8080  and click "Run workload"
+```
+
+A dependency-free C++ HTTP server exposes the engine's stats as JSON at `/stats`;
+the page polls it and renders the memtable filling, SSTables appearing on flush
+and merging on compaction, live read/write throughput, and the counters. The
+engine stays pure — the dashboard only reads through the DB's public accessors.
+
 ThreadSanitizer build (validates the concurrent reads + background compaction):
 
 ```bash
