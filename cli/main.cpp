@@ -17,7 +17,8 @@ int usage() {
                  "usage:\n"
                  "  lsmkv <dir> put <key> <value>\n"
                  "  lsmkv <dir> get <key>\n"
-                 "  lsmkv <dir> del <key>\n");
+                 "  lsmkv <dir> del <key>\n"
+                 "  lsmkv <dir> scan <start> <end>\n");
     return 2;
 }
 
@@ -51,6 +52,16 @@ int main(int argc, char** argv) {
         if (argc != 4) return usage();
         db.del(argv[3]);
         std::printf("OK\n");
+        return 0;
+    }
+    if (cmd == "scan") {
+        if (argc != 5) return usage();
+        for (const auto& [key, value] : db.scan(argv[3], argv[4])) {
+            std::fwrite(key.data(), 1, key.size(), stdout);
+            std::fputc('\t', stdout);
+            std::fwrite(value.data(), 1, value.size(), stdout);
+            std::fputc('\n', stdout);
+        }
         return 0;
     }
     return usage();

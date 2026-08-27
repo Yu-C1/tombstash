@@ -278,6 +278,58 @@ std::optional<std::string> DB::get(const std::string& key) const {
     return std::nullopt;
 }
 
+std::vector<std::pair<std::string, std::string>> DB::scan(
+    const std::string& start, const std::string& end) const {
+    stat_reads_ += 1;
+    // Each source is a sorted run of records in [start, end): the memtable
+    // (newest) first, then SSTables newest to oldest.
+    std::vector<std::vector<Record>> sources;
+    std::vector<std::shared_ptr<SSTable>> snapshot;
+    {
+        std::shared_lock lock(mu_);
+        sources.push_back(memtable_.range(start, end));
+        snapshot = sstables_;
+    }
+    for (const auto& sst : snapshot) sources.push_back(sst->range(start, end));
+
+    // k-way merge: emit the smallest key across sources; the newest source
+    // holding it wins; a tombstone means the key is deleted, so it is skipped.
+    std::vector<std::pair<std::string, std::string>> out;
+    std::vector<std::size_t> cur(sources.size(), 0);
+    auto valid = [&](std::size_t j) { return cur[j] < sources[j].size(); };
+
+    for (;;) {
+        bool any = false;
+        std::string min_key;
+        for (std::size_t j = 0; j < sources.size(); ++j) {
+            if (!valid(j)) continue;
+            const std::string& k = sources[j][cur[j]].key;
+            if (!any || k < min_key) {
+                min_key = k;
+                any = true;
+            }
+        }
+        if (!any) break;
+
+        std::size_t newest = 0;
+        for (std::size_t j = 0; j < sources.size(); ++j) {
+            if (valid(j) && sources[j][cur[j]].key == min_key) {
+                newest = j;
+                break;
+            }
+        }
+        const Record& rec = sources[newest][cur[newest]];
+        bool live = rec.op == Op::Put;
+        std::string value = rec.value;
+
+        for (std::size_t j = 0; j < sources.size(); ++j) {
+            if (valid(j) && sources[j][cur[j]].key == min_key) ++cur[j];
+        }
+        if (live) out.emplace_back(min_key, std::move(value));
+    }
+    return out;
+}
+
 void DB::sync() {
     std::unique_lock lock(mu_);
     wal_.sync();

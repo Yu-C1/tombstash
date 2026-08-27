@@ -32,6 +32,10 @@ public:
     // to write to an SSTable on flush.
     std::vector<Record> snapshot() const;
 
+    // Entries with start <= key < end, ascending, tombstones included. For scans.
+    std::vector<Record> range(const std::string& start,
+                              const std::string& end) const;
+
     std::size_t entry_count() const { return entries_.size(); }
 
     // Number of entries currently held as tombstones (awaiting collection).

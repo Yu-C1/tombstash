@@ -66,15 +66,16 @@ Requires a Linux toolchain (or WSL): g++ 13+, CMake 3.16+, GoogleTest.
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # 46 tests
+ctest --test-dir build --output-on-failure     # 53 tests
 ```
 
 CLI:
 
 ```bash
 ./build/lsmkv /tmp/mydb put foo bar
-./build/lsmkv /tmp/mydb get foo      # -> bar
+./build/lsmkv /tmp/mydb get foo          # -> bar
 ./build/lsmkv /tmp/mydb del foo
+./build/lsmkv /tmp/mydb scan aaa zzz     # sorted key<TAB>value in [aaa, zzz)
 ```
 
 Benchmark (build Release, or the numbers are meaningless):
@@ -138,6 +139,12 @@ high-entropy address layout trips ThreadSanitizer's fixed mappings.
   under it. Verified race-free under ThreadSanitizer.
 - **Group commit.** `put(..., sync=false)` batches writes; one `sync()` fsyncs the
   batch, amortizing fsync latency against a window of reduced durability.
+- **Range scan.** `scan(start, end)` returns the live key-value pairs in
+  `[start, end)` in sorted order. It seeks each source (memtable + every SSTable)
+  to `start` — a binary search on each sparse index — then k-way merges them
+  forward, newest value winning and tombstones excluded. The merge is entirely at
+  read time: nothing is written, and Bloom filters do not apply (a range spans
+  keys, not one key).
 
 ## Benchmarks
 
@@ -188,7 +195,7 @@ keys, and randomly-distributed present keys.
   missing keys — and measuring block reads (not just wall-clock) proved it without
   fighting the page cache.
 - Future: block compression, a streaming SSTable builder (merge without holding a
-  whole table in memory), leveled compaction with a comparison, range scans, and
-  key-value separation (WiscKey) for large values.
+  whole table in memory), leveled compaction with a comparison, and key-value
+  separation (WiscKey) for large values.
 
 Built on Linux; `fsync` provides durability. On Windows, develop inside WSL.

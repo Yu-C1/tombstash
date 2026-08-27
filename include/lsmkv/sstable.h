@@ -57,6 +57,11 @@ public:
     // Sparse-index lookup + block scan, without consulting the Bloom filter.
     std::optional<Record> get_no_bloom(const std::string& key) const;
 
+    // Records with start <= key < end, ascending, tombstones included. Seeks to
+    // the start block via the sparse index, then reads blocks until end. For scans.
+    std::vector<Record> range(const std::string& start,
+                              const std::string& end) const;
+
     const std::string& path() const { return path_; }
     std::size_t key_count() const { return num_records_; }
     std::size_t block_count() const { return index_.size(); }

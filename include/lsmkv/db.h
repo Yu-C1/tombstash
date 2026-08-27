@@ -8,6 +8,7 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "lsmkv/memtable.h"
@@ -70,6 +71,12 @@ public:
     void put(const std::string& key, const std::string& value, bool sync = true);
     void del(const std::string& key, bool sync = true);
     std::optional<std::string> get(const std::string& key) const;
+
+    // Live key-value pairs with start <= key < end, in ascending key order.
+    // Merges the memtable and every SSTable; newest value wins, tombstones are
+    // excluded (deleted keys are not returned).
+    std::vector<std::pair<std::string, std::string>> scan(
+        const std::string& start, const std::string& end) const;
 
     // fsync the WAL, making all preceding unsynced writes durable (group commit).
     void sync();

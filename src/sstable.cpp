@@ -270,6 +270,33 @@ std::optional<Record> SSTable::get(const std::string& key) const {
     return get_no_bloom(key);
 }
 
+std::vector<Record> SSTable::range(const std::string& start,
+                                   const std::string& end) const {
+    std::vector<Record> out;
+    if (index_.empty() || !(start < end)) return out;
+
+    // First block that could hold `start`: the last block with first_key <= start
+    // (or block 0 if start precedes every block).
+    auto it = std::upper_bound(
+        index_.begin(), index_.end(), start,
+        [](const std::string& k, const IndexEntry& e) { return k < e.first_key; });
+    std::size_t bi = (it == index_.begin())
+                         ? 0
+                         : static_cast<std::size_t>((it - 1) - index_.begin());
+
+    for (std::size_t i = bi; i < index_.size(); ++i) {
+        // Blocks are sorted; once a block starts at or past `end`, we are done.
+        if (index_[i].first_key >= end) break;
+        std::vector<Record> recs = read_block_records(i);
+        for (Record& r : recs) {
+            if (r.key < start) continue;
+            if (r.key >= end) return out;  // sorted -> no later record is in range
+            out.push_back(std::move(r));
+        }
+    }
+    return out;
+}
+
 SSTable::Iterator::Iterator(const SSTable* sst) : sst_(sst) {
     if (!sst_->index_.empty()) load_block(0);
 }

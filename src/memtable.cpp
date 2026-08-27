@@ -65,4 +65,15 @@ std::vector<Record> Memtable::snapshot() const {
     return out;
 }
 
+std::vector<Record> Memtable::range(const std::string& start,
+                                    const std::string& end) const {
+    std::vector<Record> out;
+    for (auto it = entries_.lower_bound(start);
+         it != entries_.end() && it->first < end; ++it) {
+        out.push_back(Record{it->second.tombstone ? Op::Delete : Op::Put,
+                             it->first, it->second.value});
+    }
+    return out;
+}
+
 }  // namespace lsmkv

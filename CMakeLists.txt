@@ -45,7 +45,8 @@ add_executable(unit_tests
   tests/db_recovery_test.cpp
   tests/db_sstable_test.cpp
   tests/compaction_test.cpp
-  tests/db_stats_test.cpp)
+  tests/db_stats_test.cpp
+  tests/scan_test.cpp)
 target_link_libraries(unit_tests PRIVATE lsmkv GTest::gtest GTest::gtest_main)
 # PRE_TEST defers enumeration to test time, so a sanitizer build does not run the
 # instrumented binary during the build (ThreadSanitizer needs ASLR disabled --
