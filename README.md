@@ -73,7 +73,7 @@ Requires a Linux toolchain (or WSL): g++ 13+, CMake 3.16+, GoogleTest.
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # 74 tests
+ctest --test-dir build --output-on-failure     # 80 tests
 ```
 
 CLI:
@@ -133,7 +133,24 @@ high-entropy address layout trips ThreadSanitizer's fixed mappings.
   "skip absent keys" behavior at a fraction of the RAM.
 - **Size-tiered vs leveled compaction.** Size-tiered: merge several similar-size
   SSTables into one larger table. Simpler and lower write amplification than
-  leveled, at the cost of higher read/space amplification.
+  leveled, at the cost of higher read/space amplification. A merge must be
+  **age-contiguous** — only tables adjacent in the newest→oldest list. Grouping
+  purely by size can skip a differently-sized table that sits between them in age
+  (say a tiny table from a single-key overwrite between two big ones); merging
+  across that gap would keep the older value and, placed at the newest input's
+  age, shadow the newer one. Restricting a pick to a consecutive run rules that
+  out.
+- **Crash safety: the manifest.** Which SSTables make up the store, and in what
+  age order, is recorded in a `MANIFEST` file — not inferred from filenames. A
+  filename's sequence number can't encode age after a compaction, whose output
+  gets a fresh high number but holds older data; sorting by it on reload would
+  order tables wrong and surface a stale value. The manifest stores the age order
+  explicitly, so a reopen reconstructs exactly the in-memory order. It is written
+  atomically (temp + fsync + rename + dir fsync) as the single commit point of
+  every flush, compaction, and GC: the new file set is durable in the manifest
+  *before* any superseded file is unlinked, so a file the live manifest names
+  always exists. On open, any sst/vlog file the manifest does not reference is a
+  leftover from an interrupted operation and is deleted.
 - **Tombstone dropping.** A delete writes a tombstone that shadows older data. It
   is dropped during compaction only when the merge set reaches the oldest table —
   otherwise an un-merged older file could resurrect the key. The merged table
@@ -301,6 +318,15 @@ running throughout the generation swap.
   reader and the flusher can touch it at once without locking. The subtlety is
   durability, not speed — the sealed memtable needs its own WAL until its SSTable
   lands, which meant rotating the log and handling a leftover one on recovery.
+- A single sequence number can't do two jobs. Using it as both a unique filename
+  and the age order breaks after a compaction, whose output is newer by number but
+  older by data — reads went stale after a restart. Reasoning through that turned
+  up a second, worse bug hiding behind it: size-tiered compaction grouped tables
+  by size alone, so it could merge an age-non-contiguous set and resurrect an
+  overwritten value *without any restart at all*. The lesson was to derive age
+  from something that actually records it (a manifest) and to keep every merge
+  age-contiguous — and that a reopen-consistency fuzz test is worth more than any
+  number of hand-picked cases for catching this class of ordering bug.
 - Future: incremental segmented value-log GC (reclaim without the stop-the-world
   pause), block compression, a streaming SSTable builder (merge without holding a
   whole table in memory), and leveled compaction with a comparison.

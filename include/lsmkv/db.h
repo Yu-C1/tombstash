@@ -123,8 +123,15 @@ public:
 
 private:
     void flush_locked();          // synchronous flush; caller holds the exclusive lock
-    void load_sstables();         // called once from the constructor
-    void load_vlogs();            // discover + open value-log generations (ctor)
+    void load_sstables();         // bootstrap scan when there is no manifest (ctor)
+    void load_vlogs();            // bootstrap scan of value-log generations (ctor)
+    // Persist the current table set + next_seq + current_gen to the manifest,
+    // atomically. The commit point for any change to the table set. Caller holds
+    // the exclusive lock; must run before unlinking any file it stops referencing.
+    void write_manifest_locked();
+    // Delete sst/vlog files not in `live` (plus any *.tmp) -- leftovers from an
+    // interrupted operation. Called once at open, before recovery.
+    void cleanup_orphans(const std::vector<std::string>& live);
     void compaction_loop();       // body of the background compaction thread
     void flush_loop();            // body of the background flush thread
     // Seal the full active memtable into the immutable flushing slot and rotate

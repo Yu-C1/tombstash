@@ -8,15 +8,19 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
+#include <string>
 #include <system_error>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "lsmkv/compaction.h"
+#include "lsmkv/encoding.h"
 
 namespace lsmkv {
 
@@ -101,6 +105,129 @@ std::uint64_t wal_record_bytes(const std::string& key, const std::string& value)
     return 1 + 4 + key.size() + 4 + value.size();
 }
 
+// --- MANIFEST ---------------------------------------------------------------
+// The manifest is the authoritative record of the live table set and its age
+// order. Reload reads it instead of inferring order from filename sequence
+// numbers (which diverge from age after a compaction, whose output gets a fresh
+// high sequence but holds older data). It also carries next_seq and the current
+// value-log generation, and names every live SSTable newest-first. Any sst/vlog
+// file on disk not referenced by it is a leftover from an interrupted operation.
+//
+// Format: [magic:8 "LSMKVMAN"][next_seq:8][current_gen:4][num_tables:4]
+//         then num_tables x [namelen:4][name]. Names are basenames.
+constexpr char kManMagic[8] = {'L', 'S', 'M', 'K', 'V', 'M', 'A', 'N'};
+
+struct ManifestData {
+    std::uint64_t next_seq = 0;
+    std::uint32_t current_gen = 0;
+    std::vector<std::string> tables;  // basenames, newest first
+};
+
+void write_file_sync(const std::string& path, const std::string& contents) {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "manifest open: " + path);
+    }
+    std::size_t written = 0;
+    while (written < contents.size()) {
+        ssize_t n = ::write(fd, contents.data() + written, contents.size() - written);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            int e = errno;
+            ::close(fd);
+            throw std::system_error(e, std::generic_category(), "manifest write");
+        }
+        written += static_cast<std::size_t>(n);
+    }
+    if (::fsync(fd) != 0) {
+        int e = errno;
+        ::close(fd);
+        throw std::system_error(e, std::generic_category(), "manifest fsync");
+    }
+    ::close(fd);
+}
+
+// Atomically replace the manifest: write a temp copy, fsync it, rename over the
+// old one, then fsync the directory so the rename is durable. The rename is the
+// commit point at which the DB's table set officially changes.
+void manifest_write(const std::string& dir, const ManifestData& m) {
+    std::string buf;
+    buf.append(kManMagic, sizeof(kManMagic));
+    enc::put_u64_le(buf, m.next_seq);
+    enc::put_u32_le(buf, m.current_gen);
+    enc::put_u32_le(buf, static_cast<std::uint32_t>(m.tables.size()));
+    for (const std::string& name : m.tables) {
+        enc::put_u32_le(buf, static_cast<std::uint32_t>(name.size()));
+        buf.append(name);
+    }
+    std::string tmp = (fs::path(dir) / "MANIFEST.tmp").string();
+    std::string final = (fs::path(dir) / "MANIFEST").string();
+    write_file_sync(tmp, buf);
+    if (std::rename(tmp.c_str(), final.c_str()) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "manifest rename: " + tmp);
+    }
+    fsync_dir(dir);
+}
+
+std::optional<ManifestData> manifest_read(const std::string& dir) {
+    std::string path = (fs::path(dir) / "MANIFEST").string();
+    std::error_code ec;
+    if (!fs::exists(path, ec)) return std::nullopt;
+
+    std::string b;
+    {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            throw std::system_error(errno, std::generic_category(),
+                                    "manifest open: " + path);
+        }
+        char tmp[4096];
+        for (;;) {
+            ssize_t n = ::read(fd, tmp, sizeof(tmp));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                int e = errno;
+                ::close(fd);
+                throw std::system_error(e, std::generic_category(), "manifest read");
+            }
+            if (n == 0) break;
+            b.append(tmp, static_cast<std::size_t>(n));
+        }
+        ::close(fd);
+    }
+
+    std::size_t p = 0;
+    auto need = [&](std::size_t n) {
+        if (p + n > b.size()) throw std::runtime_error("manifest: truncated");
+    };
+    need(8);
+    if (std::memcmp(b.data(), kManMagic, sizeof(kManMagic)) != 0) {
+        throw std::runtime_error("manifest: bad magic");
+    }
+    p += 8;
+    ManifestData m;
+    need(8);
+    m.next_seq = enc::read_u64_le(b.data() + p);
+    p += 8;
+    need(4);
+    m.current_gen = enc::read_u32_le(b.data() + p);
+    p += 4;
+    need(4);
+    std::uint32_t count = enc::read_u32_le(b.data() + p);
+    p += 4;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        need(4);
+        std::uint32_t len = enc::read_u32_le(b.data() + p);
+        p += 4;
+        need(len);
+        m.tables.emplace_back(b, p, len);
+        p += len;
+    }
+    return m;
+}
+
 }  // namespace
 
 DB::DB(const std::string& dir, std::size_t memtable_threshold,
@@ -113,8 +240,24 @@ DB::DB(const std::string& dir, std::size_t memtable_threshold,
       size_ratio_(size_ratio),
       value_sep_threshold_(value_sep_threshold),
       wal_(wal_path_) {
-    load_sstables();
-    load_vlogs();
+    // Load the committed table set. The manifest is authoritative when present;
+    // otherwise (a fresh store, or one from before manifests) fall back to a
+    // directory scan and write a manifest once recovery is done.
+    std::optional<ManifestData> man = manifest_read(dir_);
+    if (man) {
+        next_seq_ = man->next_seq;
+        current_gen_ = man->current_gen;
+        for (const std::string& name : man->tables) {
+            sstables_.push_back(
+                std::make_shared<SSTable>((fs::path(dir_) / name).string()));
+        }
+        std::string vp = (fs::path(dir_) / vlog_name(current_gen_)).string();
+        vlogs_[current_gen_] = std::make_shared<ValueLog>(vp, current_gen_);
+        cleanup_orphans(man->tables);  // drop files no committed manifest references
+    } else {
+        load_sstables();  // bootstrap: order by sequence (best effort)
+        load_vlogs();
+    }
 
     // Recovery. A leftover wal-flushing.log means a crash after a memtable was
     // sealed but before its flush finished; its data is older than the active WAL.
@@ -135,13 +278,43 @@ DB::DB(const std::string& dir, std::size_t memtable_threshold,
     }
     for (const Record& rec : Wal::replay(wal_path_)) apply(rec);
     if (had_flushing) {
-        flush_locked();  // durably persist the recovered data before dropping its WAL
+        flush_locked();  // durably persist the recovered data (also writes a manifest)
         fs::remove(flushing_wal);
         fsync_dir(dir_);
     }
+    // Establish a manifest for a store that had none (fresh or pre-manifest).
+    if (!man) write_manifest_locked();
 
     compactor_ = std::thread(&DB::compaction_loop, this);
     flusher_ = std::thread(&DB::flush_loop, this);
+}
+
+void DB::write_manifest_locked() {
+    ManifestData m;
+    m.next_seq = next_seq_;
+    m.current_gen = current_gen_;
+    m.tables.reserve(sstables_.size());
+    for (const auto& t : sstables_) {
+        m.tables.push_back(fs::path(t->path()).filename().string());
+    }
+    manifest_write(dir_, m);
+}
+
+void DB::cleanup_orphans(const std::vector<std::string>& live) {
+    std::unordered_set<std::string> keep(live.begin(), live.end());
+    for (const auto& entry : fs::directory_iterator(dir_)) {
+        if (!entry.is_regular_file()) continue;
+        std::string name = entry.path().filename().string();
+        if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
+            fs::remove(entry.path());  // interrupted write (incl. MANIFEST.tmp)
+            continue;
+        }
+        if (parse_seq(name)) {  // an SSTable file
+            if (!keep.count(name)) fs::remove(entry.path());  // not in the manifest
+        } else if (auto g = parse_vlog_gen(name)) {  // a value-log file
+            if (*g != current_gen_) fs::remove(entry.path());  // superseded/orphaned
+        }
+    }
 }
 
 DB::~DB() {
@@ -238,6 +411,7 @@ void DB::flush_locked() {
     stat_vlog_bytes_ += vlog_written;
 
     sstables_.insert(sstables_.begin(), std::make_shared<SSTable>(final_path));
+    write_manifest_locked();  // commit the new table set before dropping the WAL
     memtable_ = Memtable{};
     // Flushed data is durable in the SSTable, so the old WAL can be discarded.
     wal_ = Wal(wal_path_, /*truncate=*/true);
@@ -323,11 +497,12 @@ void DB::flush_loop() {
         {
             std::unique_lock lock(mu_);
             sstables_.insert(sstables_.begin(), output);  // newest
+            write_manifest_locked();  // commit before dropping the sealed WAL
             stat_flush_bytes_ += bytes;
             stat_vlog_bytes_ += vlog_written;
             flushing_memtable_ = Memtable{};
             has_flushing_ = false;
-            // The data is durable in the SSTable; drop its write-ahead log.
+            // The data is durable in a manifest-listed SSTable; drop its WAL.
             std::error_code ec;
             fs::remove(flushing_wal_path(), ec);
             cv_.notify_all();  // wake waiting writers, the compactor, GC
@@ -350,7 +525,6 @@ void DB::install_merge_result(
     bool inserted = false;
     for (const auto& sp : sstables_) {
         if (input_set.count(sp.get())) {
-            sp->mark_obsolete();  // unlinked when the last reader releases it
             if (!inserted) {
                 next.push_back(output);  // output takes the newest input's slot
                 inserted = true;
@@ -361,6 +535,12 @@ void DB::install_merge_result(
     }
     if (!inserted) next.push_back(output);  // defensive: inputs all gone
     sstables_ = std::move(next);
+
+    // Commit the new set BEFORE unlinking any input, so every file the live
+    // manifest names always exists on disk. The inputs are unlinked when the
+    // last reader that snapshotted them releases them.
+    write_manifest_locked();
+    for (const auto& sp : inputs) sp->mark_obsolete();
 }
 
 void DB::compaction_loop() {
@@ -625,18 +805,24 @@ void DB::gc_value_log() {
     fsync_dir(dir_);
     auto output = std::make_shared<SSTable>(final_path);
 
-    // Commit. The new SSTable becomes the only table; the old tables and every
-    // old generation are marked obsolete and unlinked once the last reader that
+    // Set the new state, then commit it to the manifest, then unlink the old
+    // files -- never before, so every file the live manifest names exists. The
+    // old tables and generations are unlinked once the last reader that
     // snapshotted them releases them (the SSTable lifetime rule, reused).
-    for (auto& in : inputs) in->mark_obsolete();
     sstables_ = {output};
-    for (auto& [g, log] : vlogs_) {
-        (void)g;
-        log->mark_obsolete();
-    }
-    vlogs_.clear();
     vlogs_[new_gen] = new_vlog;
     current_gen_ = new_gen;
+    write_manifest_locked();  // commit: [output], generation = new_gen
+
+    for (auto& in : inputs) in->mark_obsolete();
+    for (auto it = vlogs_.begin(); it != vlogs_.end();) {
+        if (it->first != new_gen) {
+            it->second->mark_obsolete();
+            it = vlogs_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
     stat_compaction_bytes_ += bytes;
     stat_vlog_bytes_ += relocated;

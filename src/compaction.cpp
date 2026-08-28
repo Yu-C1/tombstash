@@ -36,25 +36,32 @@ std::optional<CompactionPick> pick_compaction(
     const std::vector<std::shared_ptr<SSTable>>& tables, std::size_t min_merge,
     double size_ratio) {
     if (min_merge < 2 || tables.size() < min_merge) return std::nullopt;
+    const std::size_t n = tables.size();
 
-    // Group table indices by size bucket. std::map keeps buckets ordered from
-    // smallest size to largest.
-    std::map<long, std::vector<std::size_t>> buckets;
-    for (std::size_t i = 0; i < tables.size(); ++i) {
-        buckets[size_bucket(tables[i]->size_bytes(), size_ratio)].push_back(i);
-    }
-
-    // Smallest qualifying bucket first: compact small tables before big ones.
-    for (const auto& [bucket, indices] : buckets) {
-        (void)bucket;
-        if (indices.size() >= min_merge) {
+    // A merge must be age-contiguous. `tables` is newest-first, so a set of
+    // *consecutive* indices has no other table interleaved in age; a set with a
+    // gap does -- and if that skipped table holds a newer value for a key an
+    // older merged table also holds, the merge would keep the older value and,
+    // placed at the newest input's slot, shadow the newer one. So restrict a pick
+    // to a maximal run of consecutive tables in the same size bucket, and prefer
+    // the smallest such bucket (compact small, newer tables before big ones).
+    std::optional<CompactionPick> best;
+    long best_bucket = 0;
+    std::size_t i = 0;
+    while (i < n) {
+        long b = size_bucket(tables[i]->size_bytes(), size_ratio);
+        std::size_t j = i;
+        while (j < n && size_bucket(tables[j]->size_bytes(), size_ratio) == b) ++j;
+        if (j - i >= min_merge && (!best || b < best_bucket)) {
             CompactionPick pick;
-            pick.indices = indices;  // already ascending
-            pick.drop_tombstones = contiguous_to_oldest(indices, tables.size());
-            return pick;
+            for (std::size_t k = i; k < j; ++k) pick.indices.push_back(k);
+            pick.drop_tombstones = contiguous_to_oldest(pick.indices, n);
+            best = std::move(pick);
+            best_bucket = b;
         }
+        i = j;
     }
-    return std::nullopt;
+    return best;
 }
 
 std::vector<Record> merge_records(
