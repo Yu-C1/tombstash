@@ -44,7 +44,7 @@ protected:
 TEST_F(KvSepTest, ValueLogRoundTrip) {
     fs::create_directories(dir());
     std::string path = (dir_ / "vlog.log").string();
-    ValueLog vlog(path);
+    ValueLog vlog(path, /*gen=*/0);
     ValuePtr a = vlog.append("k1", "hello");
     ValuePtr b = vlog.append("k2", "world!!");
     vlog.sync();
@@ -60,12 +60,12 @@ TEST_F(KvSepTest, ValueLogReopenReadsPriorEntries) {
     std::string path = (dir_ / "vlog.log").string();
     ValuePtr a, b;
     {
-        ValueLog vlog(path);
+        ValueLog vlog(path, /*gen=*/0);
         a = vlog.append("k1", "first");
         vlog.sync();
     }
     {
-        ValueLog vlog(path);  // reopen: appends continue after existing bytes
+        ValueLog vlog(path, /*gen=*/0);  // reopen: appends continue after existing bytes
         b = vlog.append("k2", "second");
         vlog.sync();
         EXPECT_EQ(vlog.read(a), "first");   // prior entry still readable

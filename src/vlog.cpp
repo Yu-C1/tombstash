@@ -47,7 +47,8 @@ std::string pread_exact(int fd, std::uint64_t off, std::size_t len) {
 
 }  // namespace
 
-ValueLog::ValueLog(std::string path) : path_(std::move(path)) {
+ValueLog::ValueLog(std::string path, std::uint32_t gen)
+    : path_(std::move(path)), gen_(gen) {
     fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd_ < 0) {
         throw std::system_error(errno, std::generic_category(),
@@ -68,6 +69,7 @@ ValueLog::ValueLog(std::string path) : path_(std::move(path)) {
 
 ValueLog::~ValueLog() {
     if (fd_ >= 0) ::close(fd_);
+    if (obsolete_) ::unlink(path_.c_str());
 }
 
 ValuePtr ValueLog::append(const std::string& key, const std::string& value) {
@@ -87,6 +89,7 @@ ValuePtr ValueLog::append(const std::string& key, const std::string& value) {
 
     // Point straight at the value payload, past [klen:4][key][vlen:4].
     ValuePtr ptr;
+    ptr.gen = gen_;
     ptr.offset = rec_off + 4 + key.size() + 4;
     ptr.len = static_cast<std::uint32_t>(value.size());
     return ptr;

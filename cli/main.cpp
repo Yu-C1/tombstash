@@ -18,7 +18,8 @@ int usage() {
                  "  lsmkv <dir> put <key> <value>\n"
                  "  lsmkv <dir> get <key>\n"
                  "  lsmkv <dir> del <key>\n"
-                 "  lsmkv <dir> scan <start> <end>\n");
+                 "  lsmkv <dir> scan <start> <end>\n"
+                 "  lsmkv <dir> gc\n");
     return 2;
 }
 
@@ -62,6 +63,12 @@ int main(int argc, char** argv) {
             std::fwrite(value.data(), 1, value.size(), stdout);
             std::fputc('\n', stdout);
         }
+        return 0;
+    }
+    if (cmd == "gc") {
+        if (argc != 3) return usage();
+        db.gc_value_log();
+        std::printf("OK\n");
         return 0;
     }
     return usage();

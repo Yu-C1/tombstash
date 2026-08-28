@@ -93,6 +93,18 @@ void write_svg(const std::string& path, const std::vector<std::string>& labels,
     }
 }
 
+// Total bytes of the value-log files (vlog-*.log) in a DB directory.
+std::uint64_t vlog_disk_bytes(const std::string& dir) {
+    std::uint64_t total = 0;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        std::string n = e.path().filename().string();
+        if (n.rfind("vlog-", 0) == 0 && e.is_regular_file()) {
+            total += fs::file_size(e.path());
+        }
+    }
+    return total;
+}
+
 // Totals for one write-amplification run.
 struct WaResult {
     std::uint64_t user = 0, wal = 0, flush = 0, compaction = 0, vlog = 0;
@@ -303,6 +315,33 @@ int main(int argc, char** argv) {
                 mib(in.sstable_disk), mib(sep.sstable_disk + sep.vlog));
     std::printf("  compaction bytes cut by separation : %.2fx\n",
                 sep.compaction ? (double)in.compaction / sep.compaction : 0.0);
+
+    // --- Value-log GC: reclaim dead bytes after repeated overwrites -----------
+    fs::path dir_gc = fs::temp_directory_path() / "lsmkv_bench_gc";
+    fs::remove_all(dir_gc);
+    {
+        DB db_gc(dir_gc.string(), DB::kDefaultThreshold, kNoAutoCompact,
+                 DB::kDefaultSizeRatio, /*value_sep=*/64);
+        const int gk = std::min(n, 50'000);
+        const int rounds = 4;  // each round overwrites every key -> dead copies
+        for (int r = 0; r < rounds; ++r) {
+            for (int i = 0; i < gk; ++i) db_gc.put(key_of(i), value, /*sync=*/false);
+            db_gc.sync();
+            db_gc.flush();
+        }
+        std::uint64_t vlog_before = vlog_disk_bytes(dir_gc.string());
+        db_gc.gc_value_log();
+        std::uint64_t vlog_after = vlog_disk_bytes(dir_gc.string());
+        std::printf("\n== Value-log GC (%d keys x %d overwrite rounds) ==\n",
+                    gk, rounds);
+        std::printf("  value-log on disk before GC      : %10.1f MiB\n",
+                    mib(vlog_before));
+        std::printf("  value-log on disk after GC       : %10.1f MiB\n",
+                    mib(vlog_after));
+        std::printf("  space reclaimed                  : %10.2fx\n",
+                    vlog_after ? (double)vlog_before / vlog_after : 0.0);
+    }
+    fs::remove_all(dir_gc);
 
     std::printf("\n== Bloom filter (missing-key phase) ==\n");
     std::printf("  checks                           : %.0f\n", miss_checks);

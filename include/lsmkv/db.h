@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -96,6 +97,14 @@ public:
     // benchmarks and to reclaim space on demand.
     void compact_all();
 
+    // Garbage-collect the value log: merge all SSTables, copy only the values
+    // still referenced into a fresh value-log generation (rewriting the pointers),
+    // and drop the old generation and SSTables. Reclaims the space left by
+    // overwritten and deleted separated values. Synchronous and stop-the-world
+    // (holds the exclusive lock for the whole pass); call it occasionally, not per
+    // write. A full-GC design -- see the README for the incremental alternative.
+    void gc_value_log();
+
     // Turn the Bloom-filter read optimization on or off (to benchmark its value).
     void set_bloom_enabled(bool on);
 
@@ -114,6 +123,7 @@ public:
 private:
     void flush_locked();          // caller holds the exclusive lock
     void load_sstables();         // called once from the constructor
+    void load_vlogs();            // discover + open value-log generations (ctor)
     void compaction_loop();       // body of the background thread
     bool compaction_pending() const;  // caller holds the lock
     // Replace inputs (matched by identity) with output at the newest input's age
@@ -123,16 +133,20 @@ private:
 
     std::string dir_;
     std::string wal_path_;
-    std::string vlog_path_;
     std::size_t threshold_;
     std::size_t min_merge_;
     double size_ratio_;
     std::size_t value_sep_threshold_;
 
     Wal wal_;
-    ValueLog vlog_;
     Memtable memtable_;
     std::vector<std::shared_ptr<SSTable>> sstables_;  // newest first
+    // Value-log generations, keyed by generation number. New values append to the
+    // current generation; older ones are kept open only to resolve pointers that
+    // still reference them (until GC rewrites those away). Snapshotted by readers
+    // alongside sstables_, so a GC swap never pulls a log out from under a reader.
+    std::map<std::uint32_t, std::shared_ptr<ValueLog>> vlogs_;
+    std::uint32_t current_gen_ = 0;
     std::uint64_t next_seq_ = 0;
     bool bloom_enabled_ = true;
 

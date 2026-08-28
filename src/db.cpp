@@ -31,9 +31,29 @@ std::string prepare_wal_path(const std::string& dir) {
     return p.string();
 }
 
-std::string vlog_file_path(const std::string& dir) {
-    // The directory already exists by now (prepare_wal_path created it).
-    return (fs::path(dir) / "vlog.log").string();
+// Zero-padded so lexical and numeric order agree: vlog-000042.log.
+std::string vlog_name(std::uint32_t gen) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "vlog-%06lu.log",
+                  static_cast<unsigned long>(gen));
+    return buf;
+}
+
+std::optional<std::uint32_t> parse_vlog_gen(const std::string& name) {
+    const std::string prefix = "vlog-";
+    const std::string suffix = ".log";
+    if (name.size() <= prefix.size() + suffix.size()) return std::nullopt;
+    if (name.compare(0, prefix.size(), prefix) != 0) return std::nullopt;
+    if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return std::nullopt;
+    }
+    std::string digits =
+        name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+    if (digits.empty()) return std::nullopt;
+    for (char c : digits) {
+        if (c < '0' || c > '9') return std::nullopt;
+    }
+    return static_cast<std::uint32_t>(std::stoul(digits));
 }
 
 // Zero-padded so lexical and numeric order agree: sst-000042.sst.
@@ -88,14 +108,13 @@ DB::DB(const std::string& dir, std::size_t memtable_threshold,
        std::size_t value_sep_threshold)
     : dir_(dir),
       wal_path_(prepare_wal_path(dir)),
-      vlog_path_(vlog_file_path(dir)),
       threshold_(memtable_threshold),
       min_merge_(min_merge),
       size_ratio_(size_ratio),
       value_sep_threshold_(value_sep_threshold),
-      wal_(wal_path_),
-      vlog_(vlog_path_) {
+      wal_(wal_path_) {
     load_sstables();
+    load_vlogs();
     for (const Record& rec : Wal::replay(wal_path_)) {
         if (rec.op == Op::Put) {
             memtable_.put(rec.key, rec.value);
@@ -140,6 +159,25 @@ void DB::load_sstables() {
     next_seq_ = any ? max_seq + 1 : 0;
 }
 
+void DB::load_vlogs() {
+    std::uint32_t max_gen = 0;
+    bool any = false;
+    for (const auto& entry : fs::directory_iterator(dir_)) {
+        if (!entry.is_regular_file()) continue;
+        auto gen = parse_vlog_gen(entry.path().filename().string());
+        if (!gen) continue;
+        vlogs_[*gen] = std::make_shared<ValueLog>(entry.path().string(), *gen);
+        max_gen = std::max(max_gen, *gen);
+        any = true;
+    }
+    // Append to the highest generation present (its tail, if any, is written past).
+    current_gen_ = any ? max_gen : 0;
+    if (vlogs_.find(current_gen_) == vlogs_.end()) {
+        std::string p = (fs::path(dir_) / vlog_name(current_gen_)).string();
+        vlogs_[current_gen_] = std::make_shared<ValueLog>(p, current_gen_);
+    }
+}
+
 void DB::flush_locked() {
     if (memtable_.empty()) return;
 
@@ -153,7 +191,7 @@ void DB::flush_locked() {
     std::uint64_t vlog_written = 0;
     for (Record& r : recs) {
         if (r.op == Op::Put && r.value.size() >= value_sep_threshold_) {
-            ValuePtr p = vlog_.append(r.key, r.value);
+            ValuePtr p = vlogs_[current_gen_]->append(r.key, r.value);
             vlog_written += 4 + r.key.size() + 4 + r.value.size();
             r.separated = true;
             r.vptr = p;
@@ -162,7 +200,7 @@ void DB::flush_locked() {
     }
     // The value log must be durable before an SSTable pointer into it becomes
     // durable, or a crash could leave a pointer to bytes that were never written.
-    if (vlog_written) vlog_.sync();
+    if (vlog_written) vlogs_[current_gen_]->sync();
 
     std::uint64_t bytes = SSTable::build(tmp_path, recs);
     if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
@@ -277,12 +315,14 @@ void DB::del(const std::string& key, bool sync) {
 std::optional<std::string> DB::get(const std::string& key) const {
     stat_reads_ += 1;
     std::vector<std::shared_ptr<SSTable>> snapshot;
+    std::map<std::uint32_t, std::shared_ptr<ValueLog>> vlog_snap;
     bool use_bloom;
     {
         std::shared_lock lock(mu_);
         if (auto v = memtable_.get(key)) return v;
         if (memtable_.is_tombstone(key)) return std::nullopt;
         snapshot = sstables_;
+        vlog_snap = vlogs_;  // consistent with `snapshot`: GC swaps both at once
         use_bloom = bloom_enabled_;
     }
     // No lock held: compaction may run concurrently; the snapshot keeps files alive.
@@ -301,7 +341,7 @@ std::optional<std::string> DB::get(const std::string& key) const {
         }
         if (rec->op == Op::Delete) return std::nullopt;  // tombstone shadows
         // A separated value lives in the value log; one extra positioned read.
-        if (rec->separated) return vlog_.read(rec->vptr);
+        if (rec->separated) return vlog_snap.at(rec->vptr.gen)->read(rec->vptr);
         return rec->value;
     }
     return std::nullopt;
@@ -314,10 +354,12 @@ std::vector<std::pair<std::string, std::string>> DB::scan(
     // (newest) first, then SSTables newest to oldest.
     std::vector<std::vector<Record>> sources;
     std::vector<std::shared_ptr<SSTable>> snapshot;
+    std::map<std::uint32_t, std::shared_ptr<ValueLog>> vlog_snap;
     {
         std::shared_lock lock(mu_);
         sources.push_back(memtable_.range(start, end));
         snapshot = sstables_;
+        vlog_snap = vlogs_;
     }
     for (const auto& sst : snapshot) sources.push_back(sst->range(start, end));
 
@@ -353,7 +395,9 @@ std::vector<std::pair<std::string, std::string>> DB::scan(
         // cost of key-value separation for range scans (values are scattered in
         // write order, not laid out next to their keys in the block).
         std::string value;
-        if (live) value = rec.separated ? vlog_.read(rec.vptr) : rec.value;
+        if (live)
+            value = rec.separated ? vlog_snap.at(rec.vptr.gen)->read(rec.vptr)
+                                  : rec.value;
 
         for (std::size_t j = 0; j < sources.size(); ++j) {
             if (valid(j) && sources[j][cur[j]].key == min_key) ++cur[j];
@@ -404,6 +448,74 @@ void DB::compact_all() {
         inputs.clear();
         cv_.notify_all();
     }
+}
+
+void DB::gc_value_log() {
+    std::unique_lock lock(mu_);
+    // Wait out any in-flight compaction so the SSTable set is stable, then hold
+    // compacting_ so the background compactor starts no new work while GC runs.
+    cv_.wait(lock, [this] { return !compacting_; });
+    compacting_ = true;
+
+    flush_locked();  // move the memtable into an SSTable: all data now on disk
+    if (sstables_.empty()) {
+        compacting_ = false;
+        cv_.notify_all();
+        return;
+    }
+    std::vector<std::shared_ptr<SSTable>> inputs = sstables_;  // all, newest-first
+
+    // The merge picks the live records (newest per key, tombstones dropped since
+    // it reaches the oldest table). Any value whose pointer does not survive the
+    // merge is dead and is simply never copied to the new generation.
+    std::vector<Record> merged = merge_records(inputs, /*drop_tombstones=*/true);
+
+    std::uint32_t new_gen = current_gen_ + 1;
+    std::string vpath = (fs::path(dir_) / vlog_name(new_gen)).string();
+    auto new_vlog = std::make_shared<ValueLog>(vpath, new_gen);
+
+    // Relocate each surviving value into the new generation and repoint it.
+    std::uint64_t relocated = 0;
+    for (Record& rec : merged) {
+        if (rec.separated) {
+            std::string v = vlogs_.at(rec.vptr.gen)->read(rec.vptr);
+            rec.vptr = new_vlog->append(rec.key, v);
+            relocated += 4 + rec.key.size() + 4 + v.size();
+        }
+    }
+    new_vlog->sync();  // durable before the SSTable that points into it
+
+    std::uint64_t seq = next_seq_++;
+    std::string final_path = (fs::path(dir_) / sst_name(seq)).string();
+    std::string tmp_path = final_path + ".tmp";
+    std::uint64_t bytes = SSTable::build(tmp_path, merged);
+    if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "gc rename: " + tmp_path);
+    }
+    fsync_dir(dir_);
+    auto output = std::make_shared<SSTable>(final_path);
+
+    // Commit. The new SSTable becomes the only table; the old tables and every
+    // old generation are marked obsolete and unlinked once the last reader that
+    // snapshotted them releases them (the SSTable lifetime rule, reused).
+    for (auto& in : inputs) in->mark_obsolete();
+    sstables_ = {output};
+    for (auto& [g, log] : vlogs_) {
+        (void)g;
+        log->mark_obsolete();
+    }
+    vlogs_.clear();
+    vlogs_[new_gen] = new_vlog;
+    current_gen_ = new_gen;
+
+    stat_compaction_bytes_ += bytes;
+    stat_vlog_bytes_ += relocated;
+    stat_compactions_ += 1;
+
+    compacting_ = false;
+    inputs.clear();  // let obsolete files unlink once readers release them
+    cv_.notify_all();
 }
 
 void DB::set_bloom_enabled(bool on) {

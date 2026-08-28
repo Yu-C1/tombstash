@@ -79,6 +79,7 @@ void append_record(std::string& buf, const Record& rec) {
         enc::put_u32_le(buf, static_cast<std::uint32_t>(rec.key.size()));
         buf.append(rec.key);
         enc::put_u32_le(buf, rec.vptr.len);
+        enc::put_u32_le(buf, rec.vptr.gen);
         enc::put_u64_le(buf, rec.vptr.offset);
     } else {
         buf.push_back(static_cast<char>(op));
@@ -105,11 +106,13 @@ std::size_t parse_one(const std::string& b, std::size_t p, Record& out) {
     std::uint32_t vlen = enc::read_u32_le(b.data() + p);
     p += 4;
     if (separated) {
-        if (p + 8 > b.size()) throw std::runtime_error("SSTable: bad value pointer");
+        if (p + 12 > b.size()) throw std::runtime_error("SSTable: bad value pointer");
         out.vptr.len = vlen;
+        out.vptr.gen = enc::read_u32_le(b.data() + p);
+        p += 4;
         out.vptr.offset = enc::read_u64_le(b.data() + p);
-        out.value.clear();
         p += 8;
+        out.value.clear();
     } else {
         if (p + vlen > b.size()) throw std::runtime_error("SSTable: bad value length");
         out.value.assign(b, p, vlen);

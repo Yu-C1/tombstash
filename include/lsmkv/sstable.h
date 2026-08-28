@@ -27,7 +27,7 @@ namespace lsmkv {
 // File layout:
 //   [data region ]  concatenated blocks; each block is sorted records
 //                   inline:    [op:1][klen:4][key][vlen:4][val]
-//                   separated: [op|0x80:1][klen:4][key][vlen:4][vlog_offset:8]
+//                   separated: [op|0x80:1][klen:4][key][vlen:4][vlog_gen:4][vlog_offset:8]
 //   [index block ]  one entry per block: [klen:4][first_key][offset:8][length:8]
 //   [bloom block ]  serialized Bloom filter
 //   [footer      ]  [data_size:8][index_size:8][bloom_size:8][num_records:8][magic:8]

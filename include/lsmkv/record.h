@@ -11,10 +11,14 @@ enum class Op : uint8_t {
 };
 
 // Locates a value stored out-of-line in the value log (WiscKey key-value
-// separation). offset points at the value's payload bytes; len is its length.
+// separation). The value log is generational: garbage collection rewrites the
+// live values into a fresh generation and drops the old file, so a pointer names
+// which generation holds its bytes. offset points at the value's payload; len is
+// its length.
 struct ValuePtr {
-    std::uint64_t offset = 0;
-    std::uint32_t len = 0;
+    std::uint32_t gen = 0;     // value-log generation (file) holding the value
+    std::uint64_t offset = 0;  // byte offset of the value payload in that log
+    std::uint32_t len = 0;     // value length
 };
 
 // One logical write. Keys and values are arbitrary byte strings, so std::string

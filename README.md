@@ -71,7 +71,7 @@ Requires a Linux toolchain (or WSL): g++ 13+, CMake 3.16+, GoogleTest.
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # 64 tests
+ctest --test-dir build --output-on-failure     # 69 tests
 ```
 
 CLI:
@@ -81,6 +81,7 @@ CLI:
 ./build/lsmkv /tmp/mydb get foo          # -> bar
 ./build/lsmkv /tmp/mydb del foo
 ./build/lsmkv /tmp/mydb scan aaa zzz     # sorted key<TAB>value in [aaa, zzz)
+./build/lsmkv /tmp/mydb gc               # reclaim dead value-log space
 ```
 
 Benchmark (build Release, or the numbers are meaningless):
@@ -160,9 +161,24 @@ high-entropy address layout trips ThreadSanitizer's fixed mappings.
   deliberately measured: a point read does one extra positioned read to fetch the
   value, a range scan does one random value-log read per key (values are scattered
   in write order, not laid beside their keys), and the append-only log has no
-  garbage collector yet, so overwritten and deleted values leave dead bytes. The
   value log is fsync'd before the SSTable that points into it, so a pointer never
   dangles after a crash.
+- **Value-log garbage collection.** The log is append-only, so overwrites and
+  deletes leave dead values behind; `gc_value_log()` reclaims them. It is a *full*
+  GC: merge every SSTable to the live record set (the merge already drops shadowed
+  values and tombstones — so whatever it keeps is exactly what's live), copy those
+  values into a fresh value-log generation while rewriting their pointers, build
+  one new SSTable, then atomically swap in the new files and drop the old
+  generation and tables. Correctness falls out of doing it single-threaded over a
+  consistent snapshot: no live-pointer races, because the merge *is* the liveness
+  check. Pointers name their generation, so a reader that snapshotted the old
+  tables and old log (both captured together) keeps resolving against them until
+  it releases — the old files are unlinked only then, exactly as obsolete SSTables
+  are. The tradeoff is that it is stop-the-world and rewrites everything; the
+  production answer is incremental *segmented* GC (pick the highest-garbage
+  segment, relocate just its live values, refcount segments for reclaim), which
+  trades that pause for real concurrency hazards — GC racing a concurrent
+  overwrite, and reclaiming a segment a reader still points into.
 
 ## Benchmarks
 
@@ -232,6 +248,21 @@ collector the log never reclaims dead values. Separation trades space and read
 cost for write cost — the right trade only for large, write-heavy, point-lookup
 values, which is exactly why it is threshold-gated.
 
+### Value-log garbage collection
+
+50k keys overwritten 4 times (so the log holds 4 copies of each value, only the
+newest live), then `gc_value_log()`.
+
+| Value log on disk | Bytes |
+|---|---:|
+| Before GC | 23.1 MiB |
+| After GC | 5.8 MiB |
+| **Reclaimed** | **4.00×** |
+
+Four copies collapse to one — GC keeps only the live value per key and drops the
+old generation. Verified race-free under ThreadSanitizer with reader threads
+running throughout the generation swap.
+
 ## What I learned / future work
 
 - Durability is fsync latency: group commit is ~480× faster than a fsync per write
@@ -245,9 +276,14 @@ values, which is exactly why it is threshold-gated.
   free — it adds a read per lookup, turns range scans into random I/O, and needs a
   garbage collector to reclaim the log. Measuring compaction bytes separately from
   total write amplification showed where the win actually lands.
-- Future: a garbage collector for the value log (reclaim dead values by checking
-  liveness against the LSM), block compression, a streaming SSTable builder (merge
-  without holding a whole table in memory), and leveled compaction with a
-  comparison.
+- A merge that already keeps newest-per-key and drops tombstones *is* a liveness
+  oracle — full value-log GC reused it directly instead of writing a separate
+  "is this value still referenced?" check. Reusing existing invariants beat adding
+  new machinery. The hard part is purely concurrency, which the full-GC design
+  sidesteps by being stop-the-world; generational pointers let a reader keep using
+  the old log until it releases, so the swap needs no reader coordination.
+- Future: incremental segmented value-log GC (reclaim without the stop-the-world
+  pause), block compression, a streaming SSTable builder (merge without holding a
+  whole table in memory), and leveled compaction with a comparison.
 
 Built on Linux; `fsync` provides durability. On Windows, develop inside WSL.
