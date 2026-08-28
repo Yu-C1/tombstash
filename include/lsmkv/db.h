@@ -13,6 +13,7 @@
 
 #include "lsmkv/memtable.h"
 #include "lsmkv/sstable.h"
+#include "lsmkv/vlog.h"
 #include "lsmkv/wal.h"
 
 namespace lsmkv {
@@ -32,6 +33,11 @@ public:
     static constexpr std::size_t kDefaultThreshold = 4u * 1024 * 1024;  // 4 MiB
     static constexpr std::size_t kDefaultMinMerge = 4;
     static constexpr double kDefaultSizeRatio = 2.0;
+    // Values at least this many bytes are stored in the value log instead of
+    // inline in the SSTable (WiscKey key-value separation). SIZE_MAX disables
+    // separation (everything inline). Small values stay inline so short-value
+    // point reads and scans keep their single-read fast path.
+    static constexpr std::size_t kDefaultValueSepThreshold = 128;
 
     // Cumulative counters, for benchmarking and (later) the stats dashboard.
     struct Stats {
@@ -39,6 +45,7 @@ public:
         std::uint64_t wal_bytes = 0;          // bytes appended to the WAL
         std::uint64_t flush_bytes = 0;        // bytes written by memtable flushes
         std::uint64_t compaction_bytes = 0;   // bytes written by compaction merges
+        std::uint64_t vlog_bytes = 0;          // bytes appended to the value log
         std::uint64_t writes = 0;
         std::uint64_t deletes = 0;
         std::uint64_t reads = 0;
@@ -60,7 +67,8 @@ public:
     explicit DB(const std::string& dir,
                 std::size_t memtable_threshold = kDefaultThreshold,
                 std::size_t min_merge = kDefaultMinMerge,
-                double size_ratio = kDefaultSizeRatio);
+                double size_ratio = kDefaultSizeRatio,
+                std::size_t value_sep_threshold = kDefaultValueSepThreshold);
     ~DB();
 
     DB(const DB&) = delete;
@@ -115,11 +123,14 @@ private:
 
     std::string dir_;
     std::string wal_path_;
+    std::string vlog_path_;
     std::size_t threshold_;
     std::size_t min_merge_;
     double size_ratio_;
+    std::size_t value_sep_threshold_;
 
     Wal wal_;
+    ValueLog vlog_;
     Memtable memtable_;
     std::vector<std::shared_ptr<SSTable>> sstables_;  // newest first
     std::uint64_t next_seq_ = 0;
@@ -137,6 +148,7 @@ private:
     mutable std::atomic<std::uint64_t> stat_wal_bytes_{0};
     mutable std::atomic<std::uint64_t> stat_flush_bytes_{0};
     mutable std::atomic<std::uint64_t> stat_compaction_bytes_{0};
+    mutable std::atomic<std::uint64_t> stat_vlog_bytes_{0};
     mutable std::atomic<std::uint64_t> stat_writes_{0};
     mutable std::atomic<std::uint64_t> stat_deletes_{0};
     mutable std::atomic<std::uint64_t> stat_reads_{0};

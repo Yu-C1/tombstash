@@ -31,6 +31,11 @@ std::string prepare_wal_path(const std::string& dir) {
     return p.string();
 }
 
+std::string vlog_file_path(const std::string& dir) {
+    // The directory already exists by now (prepare_wal_path created it).
+    return (fs::path(dir) / "vlog.log").string();
+}
+
 // Zero-padded so lexical and numeric order agree: sst-000042.sst.
 std::string sst_name(std::uint64_t seq) {
     char buf[32];
@@ -79,13 +84,17 @@ std::uint64_t wal_record_bytes(const std::string& key, const std::string& value)
 }  // namespace
 
 DB::DB(const std::string& dir, std::size_t memtable_threshold,
-       std::size_t min_merge, double size_ratio)
+       std::size_t min_merge, double size_ratio,
+       std::size_t value_sep_threshold)
     : dir_(dir),
       wal_path_(prepare_wal_path(dir)),
+      vlog_path_(vlog_file_path(dir)),
       threshold_(memtable_threshold),
       min_merge_(min_merge),
       size_ratio_(size_ratio),
-      wal_(wal_path_) {
+      value_sep_threshold_(value_sep_threshold),
+      wal_(wal_path_),
+      vlog_(vlog_path_) {
     load_sstables();
     for (const Record& rec : Wal::replay(wal_path_)) {
         if (rec.op == Op::Put) {
@@ -138,13 +147,31 @@ void DB::flush_locked() {
     std::string final_path = (fs::path(dir_) / sst_name(seq)).string();
     std::string tmp_path = final_path + ".tmp";
 
-    std::uint64_t bytes = SSTable::build(tmp_path, memtable_.snapshot());
+    // WiscKey separation: values at least the threshold go to the value log; the
+    // SSTable keeps only a pointer, so later compactions never rewrite the value.
+    std::vector<Record> recs = memtable_.snapshot();
+    std::uint64_t vlog_written = 0;
+    for (Record& r : recs) {
+        if (r.op == Op::Put && r.value.size() >= value_sep_threshold_) {
+            ValuePtr p = vlog_.append(r.key, r.value);
+            vlog_written += 4 + r.key.size() + 4 + r.value.size();
+            r.separated = true;
+            r.vptr = p;
+            r.value.clear();
+        }
+    }
+    // The value log must be durable before an SSTable pointer into it becomes
+    // durable, or a crash could leave a pointer to bytes that were never written.
+    if (vlog_written) vlog_.sync();
+
+    std::uint64_t bytes = SSTable::build(tmp_path, recs);
     if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
         throw std::system_error(errno, std::generic_category(),
                                 "SSTable rename: " + tmp_path);
     }
     fsync_dir(dir_);
     stat_flush_bytes_ += bytes;
+    stat_vlog_bytes_ += vlog_written;
 
     sstables_.insert(sstables_.begin(), std::make_shared<SSTable>(final_path));
     memtable_ = Memtable{};
@@ -273,6 +300,8 @@ std::optional<std::string> DB::get(const std::string& key) const {
             continue;
         }
         if (rec->op == Op::Delete) return std::nullopt;  // tombstone shadows
+        // A separated value lives in the value log; one extra positioned read.
+        if (rec->separated) return vlog_.read(rec->vptr);
         return rec->value;
     }
     return std::nullopt;
@@ -320,7 +349,11 @@ std::vector<std::pair<std::string, std::string>> DB::scan(
         }
         const Record& rec = sources[newest][cur[newest]];
         bool live = rec.op == Op::Put;
-        std::string value = rec.value;
+        // A separated value costs one random value-log read per key -- the known
+        // cost of key-value separation for range scans (values are scattered in
+        // write order, not laid out next to their keys in the block).
+        std::string value;
+        if (live) value = rec.separated ? vlog_.read(rec.vptr) : rec.value;
 
         for (std::size_t j = 0; j < sources.size(); ++j) {
             if (valid(j) && sources[j][cur[j]].key == min_key) ++cur[j];
@@ -433,6 +466,7 @@ DB::Stats DB::stats() const {
     s.wal_bytes = stat_wal_bytes_.load();
     s.flush_bytes = stat_flush_bytes_.load();
     s.compaction_bytes = stat_compaction_bytes_.load();
+    s.vlog_bytes = stat_vlog_bytes_.load();
     s.writes = stat_writes_.load();
     s.deletes = stat_deletes_.load();
     s.reads = stat_reads_.load();

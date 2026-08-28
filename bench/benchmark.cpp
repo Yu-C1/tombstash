@@ -93,6 +93,44 @@ void write_svg(const std::string& path, const std::vector<std::string>& labels,
     }
 }
 
+// Totals for one write-amplification run.
+struct WaResult {
+    std::uint64_t user = 0, wal = 0, flush = 0, compaction = 0, vlog = 0;
+    std::uint64_t sstable_disk = 0;
+    std::size_t tables = 0;
+};
+
+// Write wn keys with group commit, let background compaction settle, and report
+// how many bytes hit disk. sep_threshold = SIZE_MAX keeps every value inline;
+// a small value separates them into the value log. Default min_merge/size_ratio
+// so compaction actually runs -- that repeated rewriting is what separation cuts.
+WaResult run_wa(const std::string& dir, int wn, const std::string& value,
+                std::size_t sep_threshold) {
+    fs::remove_all(dir);
+    WaResult r;
+    {
+        DB db(dir, DB::kDefaultThreshold, DB::kDefaultMinMerge,
+              DB::kDefaultSizeRatio, sep_threshold);
+        for (int i = 0; i < wn; ++i) {
+            db.put(key_of(i), value, /*sync=*/false);
+            if ((i % 1000) == 999) db.sync();
+        }
+        db.sync();
+        db.flush();
+        db.wait_for_idle();  // let tiered compaction finish
+        DB::Stats s = db.stats();
+        r.user = s.user_bytes;
+        r.wal = s.wal_bytes;
+        r.flush = s.flush_bytes;
+        r.compaction = s.compaction_bytes;
+        r.vlog = s.vlog_bytes;
+        r.sstable_disk = db.disk_bytes();
+        r.tables = db.sstable_count();
+    }
+    fs::remove_all(dir);
+    return r;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -233,6 +271,38 @@ int main(int argc, char** argv) {
                 mib(s.compaction_bytes),
                 s.user_bytes ? (double)s.compaction_bytes / s.user_bytes : 0);
     std::printf("  total write amplification        : %.2fx\n", wa);
+
+    // --- Key-value separation (WiscKey): write amp inline vs separated --------
+    // A separate, smaller workload with background compaction ON, so values are
+    // rewritten by real merges. Separation makes those merges move pointers, not
+    // values. Values here (100 B) are separated at a 64-byte threshold.
+    const int wn = std::min(n, 200'000);
+    fs::path dir_inline = fs::temp_directory_path() / "lsmkv_bench_inline";
+    fs::path dir_sep = fs::temp_directory_path() / "lsmkv_bench_sep";
+    WaResult in = run_wa(dir_inline.string(), wn, value, SIZE_MAX);
+    WaResult sep = run_wa(dir_sep.string(), wn, value, 64);
+    auto wa_of = [](const WaResult& r) {
+        return r.user ? (double)(r.wal + r.flush + r.compaction + r.vlog) / r.user
+                      : 0.0;
+    };
+
+    std::printf("\n== Key-value separation (WiscKey), %d keys, %zu-byte values ==\n",
+                wn, value.size());
+    std::printf("  %-34s %12s %12s\n", "", "inline", "separated");
+    std::printf("  %-34s %12.1f %12.1f\n", "flush bytes (MiB)",
+                mib(in.flush), mib(sep.flush));
+    std::printf("  %-34s %12.1f %12.1f\n", "compaction bytes (MiB)",
+                mib(in.compaction), mib(sep.compaction));
+    std::printf("  %-34s %12.1f %12.1f\n", "value-log bytes (MiB)",
+                mib(in.vlog), mib(sep.vlog));
+    std::printf("  %-34s %12.2fx %11.2fx\n", "total write amplification",
+                wa_of(in), wa_of(sep));
+    std::printf("  %-34s %12.1f %12.1f\n", "on-disk sstables (MiB)",
+                mib(in.sstable_disk), mib(sep.sstable_disk));
+    std::printf("  %-34s %12.1f %12.1f\n", "on-disk total incl. vlog (MiB)",
+                mib(in.sstable_disk), mib(sep.sstable_disk + sep.vlog));
+    std::printf("  compaction bytes cut by separation : %.2fx\n",
+                sep.compaction ? (double)in.compaction / sep.compaction : 0.0);
 
     std::printf("\n== Bloom filter (missing-key phase) ==\n");
     std::printf("  checks                           : %.0f\n", miss_checks);

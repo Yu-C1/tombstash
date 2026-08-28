@@ -59,6 +59,11 @@ lookup binary-searches the sparse index to a block, then reads and scans that
 block. The Bloom filter is what makes this cheap for absent keys: it skips the
 block read entirely when the key cannot be in the file.
 
+A large value (past the separation threshold) is not stored in the block at all —
+it lives in a separate append-only value log (`vlog.log`), and the record holds a
+pointer to it. This keeps values out of compaction; see the key-value separation
+note under Design decisions.
+
 ## Build and run
 
 Requires a Linux toolchain (or WSL): g++ 13+, CMake 3.16+, GoogleTest.
@@ -66,7 +71,7 @@ Requires a Linux toolchain (or WSL): g++ 13+, CMake 3.16+, GoogleTest.
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # 53 tests
+ctest --test-dir build --output-on-failure     # 64 tests
 ```
 
 CLI:
@@ -145,6 +150,19 @@ high-entropy address layout trips ThreadSanitizer's fixed mappings.
   forward, newest value winning and tombstones excluded. The merge is entirely at
   read time: nothing is written, and Bloom filters do not apply (a range spans
   keys, not one key).
+- **Key-value separation (WiscKey).** Most of an LSM's write amplification is
+  values being copied forward on every compaction. A value at least
+  `value_sep_threshold` bytes (default 128) is instead appended to a separate
+  value log, and the SSTable stores only a fixed-size pointer. Compaction then
+  merges pointers, never re-touching the value — cutting the bytes compaction
+  writes ~4× in the benchmark below. Small values stay inline so short-value point
+  reads and scans keep their single-read fast path. The costs are real and
+  deliberately measured: a point read does one extra positioned read to fetch the
+  value, a range scan does one random value-log read per key (values are scattered
+  in write order, not laid beside their keys), and the append-only log has no
+  garbage collector yet, so overwritten and deleted values leave dead bytes. The
+  value log is fsync'd before the SSTable that points into it, so a pointer never
+  dangles after a crash.
 
 ## Benchmarks
 
@@ -185,6 +203,35 @@ already prunes files whose range can't cover the key. Bloom's probe is then pure
 overhead. The filter wins precisely where the range check can't prune: missing
 keys, and randomly-distributed present keys.
 
+### Key-value separation (WiscKey)
+
+200k keys, 100-byte values, background compaction on, values separated at a
+64-byte threshold so the 100-byte values move to the value log.
+
+| | Inline | Separated |
+|---|---:|---:|
+| Flush bytes | 23.7 MiB | 6.0 MiB |
+| Compaction bytes | 17.6 MiB | **4.5 MiB** |
+| Value-log bytes | 0 | 23.1 MiB |
+| Total write amplification | 2.99× | 2.64× |
+| On-disk, SSTables | 23.7 MiB | 6.0 MiB |
+| On-disk, total incl. value log | 23.7 MiB | 29.1 MiB |
+
+The point is the **compaction bytes: 17.6 → 4.5 MiB, a 3.95× cut.** With values in
+the log, a merge rewrites 6-byte-ish pointers instead of 100-byte values, so
+repeated compaction stops re-copying the data. SSTables shrink ~4×, which also
+means more of them fit in cache.
+
+**Honest nuance:** total write amplification barely moves (2.99× → 2.64×) at this
+size — the WAL still logs every full value for durability, and 200k keys form only
+a few size tiers, so compaction wasn't the dominant cost to begin with. The
+compaction-bytes ratio is what separation actually targets, and it widens with
+dataset size and overwrite rate. Note too that total on-disk bytes *grow* (29.1 vs
+23.7 MiB): for unique keys the pointers are pure overhead, and with no garbage
+collector the log never reclaims dead values. Separation trades space and read
+cost for write cost — the right trade only for large, write-heavy, point-lookup
+values, which is exactly why it is threshold-gated.
+
 ## What I learned / future work
 
 - Durability is fsync latency: group commit is ~480× faster than a fsync per write
@@ -194,8 +241,13 @@ keys, and randomly-distributed present keys.
   Switching to a sparse index made the filter matter — 212× fewer block reads on
   missing keys — and measuring block reads (not just wall-clock) proved it without
   fighting the page cache.
-- Future: block compression, a streaming SSTable builder (merge without holding a
-  whole table in memory), leveled compaction with a comparison, and key-value
-  separation (WiscKey) for large values.
+- Key-value separation moves write cost off the compaction path but doesn't come
+  free — it adds a read per lookup, turns range scans into random I/O, and needs a
+  garbage collector to reclaim the log. Measuring compaction bytes separately from
+  total write amplification showed where the win actually lands.
+- Future: a garbage collector for the value log (reclaim dead values by checking
+  liveness against the LSM), block compression, a streaming SSTable builder (merge
+  without holding a whole table in memory), and leveled compaction with a
+  comparison.
 
 Built on Linux; `fsync` provides durability. On Windows, develop inside WSL.

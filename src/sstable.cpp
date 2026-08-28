@@ -24,6 +24,10 @@ std::atomic<std::uint64_t> g_block_reads{0};
 constexpr std::size_t kFooterSize = 40;  // 4 x u64 + 8-byte magic
 constexpr char kMagic[8] = {'L', 'S', 'M', 'K', 'V', 'S', 'S', 'T'};
 
+// High bit of the op byte marks a value stored out-of-line in the value log
+// (WiscKey separation). The op enum only uses 0/1, so the bit is free.
+constexpr unsigned char kSeparatedFlag = 0x80;
+
 void write_file_sync(const std::string& path, const std::string& contents) {
     int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -66,17 +70,32 @@ std::string pread_exact(int fd, std::uint64_t off, std::size_t len) {
 }
 
 void append_record(std::string& buf, const Record& rec) {
-    buf.push_back(static_cast<char>(rec.op));
-    enc::put_u32_le(buf, static_cast<std::uint32_t>(rec.key.size()));
-    buf.append(rec.key);
-    enc::put_u32_le(buf, static_cast<std::uint32_t>(rec.value.size()));
-    buf.append(rec.value);
+    // A separated record stores [flag|op][klen][key][vlen:4][offset:8] -- the
+    // value length (for the caller and the read) and its value-log offset, in
+    // place of the inline bytes. An inline record stores [op][klen][key][vlen][val].
+    unsigned char op = static_cast<unsigned char>(rec.op);
+    if (rec.separated) {
+        buf.push_back(static_cast<char>(op | kSeparatedFlag));
+        enc::put_u32_le(buf, static_cast<std::uint32_t>(rec.key.size()));
+        buf.append(rec.key);
+        enc::put_u32_le(buf, rec.vptr.len);
+        enc::put_u64_le(buf, rec.vptr.offset);
+    } else {
+        buf.push_back(static_cast<char>(op));
+        enc::put_u32_le(buf, static_cast<std::uint32_t>(rec.key.size()));
+        buf.append(rec.key);
+        enc::put_u32_le(buf, static_cast<std::uint32_t>(rec.value.size()));
+        buf.append(rec.value);
+    }
 }
 
 // Parse one record from bytes starting at p; fill out, return the next position.
 std::size_t parse_one(const std::string& b, std::size_t p, Record& out) {
     if (p + 1 + 4 > b.size()) throw std::runtime_error("SSTable: short record header");
-    out.op = static_cast<Op>(static_cast<unsigned char>(b[p]));
+    unsigned char op = static_cast<unsigned char>(b[p]);
+    bool separated = (op & kSeparatedFlag) != 0;
+    out.op = static_cast<Op>(op & ~kSeparatedFlag);
+    out.separated = separated;
     p += 1;
     std::uint32_t klen = enc::read_u32_le(b.data() + p);
     p += 4;
@@ -85,9 +104,17 @@ std::size_t parse_one(const std::string& b, std::size_t p, Record& out) {
     p += klen;
     std::uint32_t vlen = enc::read_u32_le(b.data() + p);
     p += 4;
-    if (p + vlen > b.size()) throw std::runtime_error("SSTable: bad value length");
-    out.value.assign(b, p, vlen);
-    p += vlen;
+    if (separated) {
+        if (p + 8 > b.size()) throw std::runtime_error("SSTable: bad value pointer");
+        out.vptr.len = vlen;
+        out.vptr.offset = enc::read_u64_le(b.data() + p);
+        out.value.clear();
+        p += 8;
+    } else {
+        if (p + vlen > b.size()) throw std::runtime_error("SSTable: bad value length");
+        out.value.assign(b, p, vlen);
+        p += vlen;
+    }
     return p;
 }
 

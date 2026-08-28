@@ -19,9 +19,15 @@ namespace lsmkv {
 // block per lookup. A per-SSTable Bloom filter lets a read skip the block read
 // entirely for keys the file does not contain.
 //
+// A value past the DB's separation threshold is stored out-of-line in the value
+// log (WiscKey); its record holds a pointer instead of the bytes, flagged by the
+// high bit of the op byte. Compaction carries such a record through by pointer,
+// so a large value is not rewritten on every merge.
+//
 // File layout:
 //   [data region ]  concatenated blocks; each block is sorted records
-//                   [op:1][klen:4][key][vlen:4][val] ...
+//                   inline:    [op:1][klen:4][key][vlen:4][val]
+//                   separated: [op|0x80:1][klen:4][key][vlen:4][vlog_offset:8]
 //   [index block ]  one entry per block: [klen:4][first_key][offset:8][length:8]
 //   [bloom block ]  serialized Bloom filter
 //   [footer      ]  [data_size:8][index_size:8][bloom_size:8][num_records:8][magic:8]
