@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -121,10 +122,20 @@ public:
     Stats stats() const;
 
 private:
-    void flush_locked();          // caller holds the exclusive lock
+    void flush_locked();          // synchronous flush; caller holds the exclusive lock
     void load_sstables();         // called once from the constructor
     void load_vlogs();            // discover + open value-log generations (ctor)
-    void compaction_loop();       // body of the background thread
+    void compaction_loop();       // body of the background compaction thread
+    void flush_loop();            // body of the background flush thread
+    // Seal the full active memtable into the immutable flushing slot and rotate
+    // the WAL, so the background flusher can write it out off the write path.
+    // Caller holds the exclusive lock.
+    void seal_locked();
+    // If the active memtable is over threshold, seal it (waiting first if a flush
+    // is already in flight -- write backpressure). Caller holds the lock; passed
+    // in so this can wait on the condition variable.
+    void maybe_seal(std::unique_lock<std::shared_mutex>& lock);
+    std::string flushing_wal_path() const;  // dir/wal-flushing.log
     bool compaction_pending() const;  // caller holds the lock
     // Replace inputs (matched by identity) with output at the newest input's age
     // slot, marking the replaced files obsolete. Caller holds the exclusive lock.
@@ -139,7 +150,10 @@ private:
     std::size_t value_sep_threshold_;
 
     Wal wal_;
-    Memtable memtable_;
+    Memtable memtable_;             // active: receives writes
+    // Sealed, immutable memtable awaiting background flush (empty when has_flushing_
+    // is false). Reads check it after the active memtable and before the SSTables.
+    Memtable flushing_memtable_;
     std::vector<std::shared_ptr<SSTable>> sstables_;  // newest first
     // Value-log generations, keyed by generation number. New values append to the
     // current generation; older ones are kept open only to resolve pointers that
@@ -154,7 +168,10 @@ private:
     std::condition_variable_any cv_;
     bool stop_ = false;
     bool compacting_ = false;
+    bool has_flushing_ = false;      // a sealed memtable is awaiting/undergoing flush
+    std::uint64_t flushing_seq_ = 0; // SSTable sequence reserved for it at seal time
     std::thread compactor_;
+    std::thread flusher_;
 
     // Stats counters. Atomic so reads/compaction can bump them without the lock;
     // mutable because get() is const but still counts Bloom activity.

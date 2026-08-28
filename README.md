@@ -38,7 +38,9 @@ amplification, which the sparse index, Bloom filters, and compaction keep in che
 
 - **Write path:** append to WAL → `fsync` → insert into memtable → return. WAL
   first: a crash after the WAL write is recoverable by replay; a crash before it
-  means the caller never saw success, so nothing is lost.
+  means the caller never saw success, so nothing is lost. When the memtable fills,
+  the write only *seals* it (a pointer swap + WAL rotation); a background thread
+  builds the SSTable, so writes never stall on a flush.
 - **Read path:** memtable first (newest), then SSTables newest → oldest. A Bloom
   filter per SSTable skips files that cannot hold the key; a sparse index locates
   the one ~4 KiB block that could, which is then read and scanned. First match
@@ -71,7 +73,7 @@ Requires a Linux toolchain (or WSL): g++ 13+, CMake 3.16+, GoogleTest.
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # 69 tests
+ctest --test-dir build --output-on-failure     # 74 tests
 ```
 
 CLI:
@@ -143,6 +145,18 @@ high-entropy address layout trips ThreadSanitizer's fixed mappings.
   only swaps the list under a brief exclusive lock. A merged-away file is unlinked
   when the last reader releases it, so a reader never has a file pulled out from
   under it. Verified race-free under ThreadSanitizer.
+- **Concurrency: background flush.** A write that fills the memtable does not build
+  the SSTable itself. Instead it *seals* the full memtable into an immutable slot,
+  starts a fresh active memtable, and rotates the WAL — all a few pointer and
+  rename operations under the lock — and a background thread builds the SSTable
+  with no write lock held. So a flush never freezes the write path. A read checks
+  three layers newest-first: active memtable, the sealed memtable being flushed,
+  then the SSTables. Only one memtable seals at a time; a writer that fills the
+  next one while a flush is still running waits (bounded memory, i.e. write
+  backpressure). The sealed memtable's WAL is renamed aside as `wal-flushing.log`
+  and dropped only once its SSTable is durable; a crash mid-flush is recovered by
+  replaying it on the next open. Verified race-free under ThreadSanitizer with
+  readers running across the flush.
 - **Group commit.** `put(..., sync=false)` batches writes; one `sync()` fsyncs the
   batch, amortizing fsync latency against a window of reduced durability.
 - **Range scan.** `scan(start, end)` returns the live key-value pairs in
@@ -282,6 +296,11 @@ running throughout the generation swap.
   new machinery. The hard part is purely concurrency, which the full-GC design
   sidesteps by being stop-the-world; generational pointers let a reader keep using
   the old log until it releases, so the swap needs no reader coordination.
+- Moving the flush off the write path (seal + background thread) is the same
+  immutability trick as snapshot reads: a sealed memtable never changes, so a
+  reader and the flusher can touch it at once without locking. The subtlety is
+  durability, not speed — the sealed memtable needs its own WAL until its SSTable
+  lands, which meant rotating the log and handling a leftover one on recovery.
 - Future: incremental segmented value-log GC (reclaim without the stop-the-world
   pause), block compression, a streaming SSTable builder (merge without holding a
   whole table in memory), and leveled compaction with a comparison.

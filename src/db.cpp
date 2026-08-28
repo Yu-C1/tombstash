@@ -115,14 +115,33 @@ DB::DB(const std::string& dir, std::size_t memtable_threshold,
       wal_(wal_path_) {
     load_sstables();
     load_vlogs();
-    for (const Record& rec : Wal::replay(wal_path_)) {
+
+    // Recovery. A leftover wal-flushing.log means a crash after a memtable was
+    // sealed but before its flush finished; its data is older than the active WAL.
+    // Replay it first, then the active WAL on top (newest wins). If one was found,
+    // flush the recovered memtable to an SSTable synchronously and drop it, so the
+    // store starts from a clean single active WAL.
+    auto apply = [this](const Record& rec) {
         if (rec.op == Op::Put) {
             memtable_.put(rec.key, rec.value);
         } else {
             memtable_.del(rec.key);
         }
+    };
+    std::string flushing_wal = flushing_wal_path();
+    bool had_flushing = fs::exists(flushing_wal);
+    if (had_flushing) {
+        for (const Record& rec : Wal::replay(flushing_wal)) apply(rec);
     }
+    for (const Record& rec : Wal::replay(wal_path_)) apply(rec);
+    if (had_flushing) {
+        flush_locked();  // durably persist the recovered data before dropping its WAL
+        fs::remove(flushing_wal);
+        fsync_dir(dir_);
+    }
+
     compactor_ = std::thread(&DB::compaction_loop, this);
+    flusher_ = std::thread(&DB::flush_loop, this);
 }
 
 DB::~DB() {
@@ -131,7 +150,14 @@ DB::~DB() {
         stop_ = true;
     }
     cv_.notify_all();
+    // A sealed-but-unflushed memtable at shutdown stays in wal-flushing.log and is
+    // recovered on the next open, so the flusher may exit without flushing it.
+    if (flusher_.joinable()) flusher_.join();
     if (compactor_.joinable()) compactor_.join();
+}
+
+std::string DB::flushing_wal_path() const {
+    return (fs::path(dir_) / "wal-flushing.log").string();
 }
 
 void DB::load_sstables() {
@@ -219,6 +245,96 @@ void DB::flush_locked() {
     cv_.notify_all();  // a new table may complete a size tier; wake the compactor
 }
 
+void DB::seal_locked() {
+    if (memtable_.empty()) return;
+    // The sealed memtable's writes are all in the current wal.log. Make them
+    // durable, then move that log aside as wal-flushing.log and start a fresh
+    // active wal.log. On a crash before the flush completes, recovery replays
+    // wal-flushing.log. The directory fsync makes the rename durable before the
+    // fresh wal.log (a new inode at the old name) is created.
+    wal_.sync();
+    std::string fw = flushing_wal_path();
+    if (std::rename(wal_path_.c_str(), fw.c_str()) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "seal WAL rename: " + wal_path_);
+    }
+    fsync_dir(dir_);
+    wal_ = Wal(wal_path_, /*truncate=*/true);  // old fd closed on assignment
+
+    // Reserve the sequence now, at seal time, so the flushed table's age (its
+    // filename sequence) reflects when its data became newest.
+    flushing_seq_ = next_seq_++;
+    flushing_memtable_ = std::exchange(memtable_, Memtable{});
+    has_flushing_ = true;
+    cv_.notify_all();  // wake the flusher (and any writer waiting for the slot)
+}
+
+void DB::maybe_seal(std::unique_lock<std::shared_mutex>& lock) {
+    if (memtable_.size_bytes() < threshold_) return;
+    // Only one memtable may be in the flushing slot at a time. If the previous
+    // flush has not finished, wait for it -- backpressure when writes outrun the
+    // flusher (better than growing unbounded memory).
+    cv_.wait(lock, [this] { return !has_flushing_ || stop_; });
+    if (stop_) return;
+    seal_locked();
+}
+
+void DB::flush_loop() {
+    for (;;) {
+        std::vector<Record> records;
+        std::shared_ptr<ValueLog> gen_log;
+        std::uint64_t seq;
+        {
+            std::unique_lock lock(mu_);
+            cv_.wait(lock, [this] { return stop_ || has_flushing_; });
+            if (stop_) return;  // a pending sealed memtable is left for recovery
+            // Snapshot the sealed (immutable) memtable and capture the current
+            // value-log generation under the lock; then work with no lock held.
+            records = flushing_memtable_.snapshot();
+            gen_log = vlogs_[current_gen_];
+            seq = flushing_seq_;
+        }
+
+        // Off-lock: WiscKey separation + build the SSTable. This flusher is the
+        // only writer of the value log (a second flush can't start until this one
+        // clears the slot, and GC waits for has_flushing_), so appending unlocked
+        // is safe; readers only pread already-published (older) offsets.
+        std::uint64_t vlog_written = 0;
+        for (Record& r : records) {
+            if (r.op == Op::Put && r.value.size() >= value_sep_threshold_) {
+                r.vptr = gen_log->append(r.key, r.value);
+                vlog_written += 4 + r.key.size() + 4 + r.value.size();
+                r.separated = true;
+                r.value.clear();
+            }
+        }
+        if (vlog_written) gen_log->sync();
+
+        std::string final_path = (fs::path(dir_) / sst_name(seq)).string();
+        std::string tmp_path = final_path + ".tmp";
+        std::uint64_t bytes = SSTable::build(tmp_path, records);
+        if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+            throw std::system_error(errno, std::generic_category(),
+                                    "flush rename: " + tmp_path);
+        }
+        fsync_dir(dir_);
+        auto output = std::make_shared<SSTable>(final_path);
+
+        {
+            std::unique_lock lock(mu_);
+            sstables_.insert(sstables_.begin(), output);  // newest
+            stat_flush_bytes_ += bytes;
+            stat_vlog_bytes_ += vlog_written;
+            flushing_memtable_ = Memtable{};
+            has_flushing_ = false;
+            // The data is durable in the SSTable; drop its write-ahead log.
+            std::error_code ec;
+            fs::remove(flushing_wal_path(), ec);
+            cv_.notify_all();  // wake waiting writers, the compactor, GC
+        }
+    }
+}
+
 bool DB::compaction_pending() const {
     return pick_compaction(sstables_, min_merge_, size_ratio_).has_value();
 }
@@ -299,7 +415,7 @@ void DB::put(const std::string& key, const std::string& value, bool sync) {
     stat_writes_ += 1;
     stat_user_bytes_ += key.size() + value.size();
     stat_wal_bytes_ += wal_record_bytes(key, value);
-    if (memtable_.size_bytes() >= threshold_) flush_locked();
+    maybe_seal(lock);  // seal + background flush when full (off the write path)
 }
 
 void DB::del(const std::string& key, bool sync) {
@@ -309,7 +425,7 @@ void DB::del(const std::string& key, bool sync) {
     stat_deletes_ += 1;
     stat_user_bytes_ += key.size();
     stat_wal_bytes_ += wal_record_bytes(key, "");
-    if (memtable_.size_bytes() >= threshold_) flush_locked();
+    maybe_seal(lock);  // seal + background flush when full (off the write path)
 }
 
 std::optional<std::string> DB::get(const std::string& key) const {
@@ -321,6 +437,12 @@ std::optional<std::string> DB::get(const std::string& key) const {
         std::shared_lock lock(mu_);
         if (auto v = memtable_.get(key)) return v;
         if (memtable_.is_tombstone(key)) return std::nullopt;
+        // Then the sealed memtable being flushed (newer than any SSTable). Its
+        // values are inline -- separation happens only when it is written out.
+        if (has_flushing_) {
+            if (auto v = flushing_memtable_.get(key)) return v;
+            if (flushing_memtable_.is_tombstone(key)) return std::nullopt;
+        }
         snapshot = sstables_;
         vlog_snap = vlogs_;  // consistent with `snapshot`: GC swaps both at once
         use_bloom = bloom_enabled_;
@@ -358,6 +480,8 @@ std::vector<std::pair<std::string, std::string>> DB::scan(
     {
         std::shared_lock lock(mu_);
         sources.push_back(memtable_.range(start, end));
+        // The sealed memtable ranks between the active memtable and the SSTables.
+        if (has_flushing_) sources.push_back(flushing_memtable_.range(start, end));
         snapshot = sstables_;
         vlog_snap = vlogs_;
     }
@@ -414,6 +538,10 @@ void DB::sync() {
 
 void DB::flush() {
     std::unique_lock lock(mu_);
+    // Let any in-flight background flush finish first, then flush the active
+    // memtable synchronously, so on return everything written so far is on disk.
+    cv_.wait(lock, [this] { return !has_flushing_ || stop_; });
+    if (stop_) return;
     flush_locked();
 }
 
@@ -452,12 +580,13 @@ void DB::compact_all() {
 
 void DB::gc_value_log() {
     std::unique_lock lock(mu_);
-    // Wait out any in-flight compaction so the SSTable set is stable, then hold
-    // compacting_ so the background compactor starts no new work while GC runs.
-    cv_.wait(lock, [this] { return !compacting_; });
+    // Wait out any in-flight compaction and background flush so the SSTable set is
+    // stable, then hold compacting_ so the compactor starts no new work while GC
+    // runs. A new flush cannot seal meanwhile because seal needs this lock.
+    cv_.wait(lock, [this] { return !compacting_ && !has_flushing_; });
     compacting_ = true;
 
-    flush_locked();  // move the memtable into an SSTable: all data now on disk
+    flush_locked();  // move the active memtable into an SSTable: all data on disk
     if (sstables_.empty()) {
         compacting_ = false;
         cv_.notify_all();
@@ -525,7 +654,9 @@ void DB::set_bloom_enabled(bool on) {
 
 void DB::wait_for_idle() {
     std::unique_lock lock(mu_);
-    cv_.wait(lock, [this] { return !compacting_ && !compaction_pending(); });
+    cv_.wait(lock, [this] {
+        return !compacting_ && !compaction_pending() && !has_flushing_;
+    });
 }
 
 std::size_t DB::memtable_entry_count() const {
