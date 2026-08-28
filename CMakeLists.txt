@@ -51,7 +51,8 @@ add_executable(unit_tests
   tests/kv_separation_test.cpp
   tests/gc_test.cpp
   tests/background_flush_test.cpp
-  tests/manifest_test.cpp)
+  tests/manifest_test.cpp
+  tests/leveled_test.cpp)
 target_link_libraries(unit_tests PRIVATE lsmkv GTest::gtest GTest::gtest_main)
 # PRE_TEST defers enumeration to test time, so a sanitizer build does not run the
 # instrumented binary during the build (ThreadSanitizer needs ASLR disabled --

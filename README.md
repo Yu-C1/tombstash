@@ -73,7 +73,7 @@ Requires a Linux toolchain (or WSL): g++ 13+, CMake 3.16+, GoogleTest.
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # 80 tests
+ctest --test-dir build --output-on-failure     # 86 tests
 ```
 
 CLI:
@@ -131,15 +131,23 @@ high-entropy address layout trips ThreadSanitizer's fixed mappings.
   reads that creates: it answers "definitely not in this file" in RAM, so absent
   keys never touch the disk. Sparse index + Bloom recreate the dense index's fast
   "skip absent keys" behavior at a fraction of the RAM.
-- **Size-tiered vs leveled compaction.** Size-tiered: merge several similar-size
-  SSTables into one larger table. Simpler and lower write amplification than
-  leveled, at the cost of higher read/space amplification. A merge must be
-  **age-contiguous** — only tables adjacent in the newest→oldest list. Grouping
-  purely by size can skip a differently-sized table that sits between them in age
-  (say a tiny table from a single-key overwrite between two big ones); merging
-  across that gap would keep the older value and, placed at the newest input's
-  age, shadow the newer one. Restricting a pick to a consecutive run rules that
-  out.
+- **Size-tiered vs leveled compaction.** Both are implemented and selectable
+  (`DB::Compaction::SizeTiered`, the default, or `Leveled`). Size-tiered merges
+  several similar-size SSTables into one larger table — simpler, lower write
+  amplification, higher read/space. Leveled keeps each level past L0 as
+  non-overlapping sorted runs split into ~target-size files: a key lives in at
+  most one file per level, so reads and space stay tight, at the cost of higher
+  write amplification (data is rewritten as it sinks level by level). A flush
+  lands in L0; when L0 fills it merges into L1; when a level exceeds its byte
+  budget one of its files merges into the overlapping files of the next level,
+  preserving non-overlap. The benchmark below measures the tradeoff. A table's
+  level is recorded in the manifest, so the structure survives a reopen.
+- **Age-contiguous merges (size-tiered).** A size-tiered merge only ever combines
+  tables adjacent in the newest→oldest list. Grouping purely by size can skip a
+  differently-sized table that sits between them in age (say a tiny table from a
+  single-key overwrite between two big ones); merging across that gap would keep
+  the older value and, placed at the newest input's age, shadow the newer one.
+  Restricting a pick to a consecutive run rules that out.
 - **Crash safety: the manifest.** Which SSTables make up the store, and in what
   age order, is recorded in a `MANIFEST` file — not inferred from filenames. A
   filename's sequence number can't encode age after a compaction, whose output
@@ -294,6 +302,25 @@ Four copies collapse to one — GC keeps only the live value per key and drops t
 old generation. Verified race-free under ThreadSanitizer with reader threads
 running throughout the generation swap.
 
+### Size-tiered vs leveled compaction
+
+Same workload — 50k keys, each written twice (so compaction has real work) —
+under each strategy, background compaction on.
+
+| | Size-tiered | Leveled |
+|---|---:|---:|
+| Write amplification | 4.01× | **6.57×** |
+| On-disk size (space) | 11.8 MiB | **6.5 MiB** |
+| Block reads / lookup (read) | 1.07 | 1.05 |
+
+The classic trade, in the store's own numbers: **leveled writes ~1.6× more** (it
+rewrites data as it sinks level by level) **to hold ~1.8× less on disk** (a key
+lives in one file per level, not duplicated across tiers). Read amplification is
+close here — Bloom filters plus the sparse-index range check already prune a
+lookup to about one block under either strategy — so the honest headline is the
+**write-vs-space** trade: pick leveled when reads and space matter, size-tiered
+when writes dominate.
+
 ## What I learned / future work
 
 - Durability is fsync latency: group commit is ~480× faster than a fsync per write
@@ -327,8 +354,12 @@ running throughout the generation swap.
   from something that actually records it (a manifest) and to keep every merge
   age-contiguous — and that a reopen-consistency fuzz test is worth more than any
   number of hand-picked cases for catching this class of ordering bug.
+- Building leveled compaction next to size-tiered made the amplification triangle
+  concrete: the same code path (merge, then split the output into fixed-size
+  files) produces a completely different write/space profile just by choosing
+  which tables to merge. Measuring both with one harness beat reasoning about it.
 - Future: incremental segmented value-log GC (reclaim without the stop-the-world
-  pause), block compression, a streaming SSTable builder (merge without holding a
-  whole table in memory), and leveled compaction with a comparison.
+  pause), block compression, and a streaming SSTable builder (merge without
+  holding a whole table in memory).
 
 Built on Linux; `fsync` provides durability. On Windows, develop inside WSL.

@@ -143,6 +143,54 @@ WaResult run_wa(const std::string& dir, int wn, const std::string& value,
     return r;
 }
 
+// One compaction strategy measured on a fixed overwrite-heavy workload.
+struct StrategyResult {
+    double write_amp = 0;         // bytes written to disk / user bytes
+    double blocks_per_read = 0;   // data-block reads per present-key lookup (read amp)
+    double disk_mib = 0;          // on-disk SSTable bytes
+    std::size_t tables = 0;
+    int max_level = 0;            // deepest level (leveled); size bucket span otherwise
+};
+
+StrategyResult run_strategy(const std::string& dir, int keys, const std::string& value,
+                            DB::Compaction strategy) {
+    fs::remove_all(dir);
+    StrategyResult r;
+    {
+        // Inline values (sep off) so the space number is purely the LSM's doing.
+        DB db(dir, 256u * 1024, DB::kDefaultMinMerge, DB::kDefaultSizeRatio, SIZE_MAX,
+              strategy);
+        std::vector<int> order = shuffled_indices(keys);
+        for (int round = 0; round < 2; ++round) {  // write each key twice -> overwrites
+            for (int idx = 0; idx < keys; ++idx) {
+                db.put(key_of(order[idx]), value, /*sync=*/false);
+                if ((idx % 1000) == 999) db.sync();
+            }
+        }
+        db.sync();
+        db.flush();
+        db.wait_for_idle();
+
+        DB::Stats s = db.stats();
+        r.write_amp = s.user_bytes
+                          ? static_cast<double>(s.wal_bytes + s.flush_bytes +
+                                                s.compaction_bytes) /
+                                s.user_bytes
+                          : 0.0;
+        r.disk_mib = db.disk_bytes() / (1024.0 * 1024.0);
+        r.tables = db.sstable_count();
+        for (const auto& in : db.sstable_infos()) r.max_level = std::max(r.max_level, in.tier);
+
+        const int reads = std::min(keys, 20'000);
+        SSTable::reset_block_reads();
+        for (int i = 0; i < reads; ++i) (void)db.get(key_of(order[i]));
+        r.blocks_per_read =
+            reads ? static_cast<double>(SSTable::block_reads()) / reads : 0.0;
+    }
+    fs::remove_all(dir);
+    return r;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -342,6 +390,26 @@ int main(int argc, char** argv) {
                     vlog_after ? (double)vlog_before / vlog_after : 0.0);
     }
     fs::remove_all(dir_gc);
+
+    // --- Size-tiered vs leveled compaction -----------------------------------
+    const int cn = std::min(n, 50'000);
+    StrategyResult tiered = run_strategy(
+        (fs::temp_directory_path() / "lsmkv_bench_tiered").string(), cn, value,
+        DB::Compaction::SizeTiered);
+    StrategyResult leveled = run_strategy(
+        (fs::temp_directory_path() / "lsmkv_bench_leveled").string(), cn, value,
+        DB::Compaction::Leveled);
+    std::printf("\n== Compaction strategy (%d keys, each written twice) ==\n", cn);
+    std::printf("  %-34s %12s %12s\n", "", "size-tiered", "leveled");
+    std::printf("  %-34s %11.2fx %11.2fx\n", "write amplification",
+                tiered.write_amp, leveled.write_amp);
+    std::printf("  %-34s %12.2f %12.2f\n", "block reads / lookup (read amp)",
+                tiered.blocks_per_read, leveled.blocks_per_read);
+    std::printf("  %-34s %12.1f %12.1f\n", "on-disk (MiB, space amp)",
+                tiered.disk_mib, leveled.disk_mib);
+    std::printf("  %-34s %12zu %12zu\n", "tables", tiered.tables, leveled.tables);
+    std::printf("  %-34s %12d %12d\n", "deepest level / tier", tiered.max_level,
+                leveled.max_level);
 
     std::printf("\n== Bloom filter (missing-key phase) ==\n");
     std::printf("  checks                           : %.0f\n", miss_checks);

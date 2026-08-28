@@ -10,6 +10,7 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -66,11 +67,19 @@ public:
         int tier = 0;  // size bucket (bigger = merged further)
     };
 
+    // Compaction strategy. Size-tiered (default) merges several similar-size
+    // tables into one larger table -- low write amplification, higher read/space.
+    // Leveled keeps each level past L0 as non-overlapping sorted runs split into
+    // ~target-size files -- low read/space amplification, higher write. See the
+    // README's comparison.
+    enum class Compaction { SizeTiered, Leveled };
+
     explicit DB(const std::string& dir,
                 std::size_t memtable_threshold = kDefaultThreshold,
                 std::size_t min_merge = kDefaultMinMerge,
                 double size_ratio = kDefaultSizeRatio,
-                std::size_t value_sep_threshold = kDefaultValueSepThreshold);
+                std::size_t value_sep_threshold = kDefaultValueSepThreshold,
+                Compaction strategy = Compaction::SizeTiered);
     ~DB();
 
     DB(const DB&) = delete;
@@ -149,19 +158,36 @@ private:
     void install_merge_result(const std::vector<std::shared_ptr<SSTable>>& inputs,
                               std::shared_ptr<SSTable> output);
 
+    void do_size_tiered_compaction();      // one size-tiered compaction step
+    // --- leveled compaction (spec section 6 alternative strategy) -------------
+    bool leveled_pending_locked() const;   // is a leveled compaction due?
+    void do_leveled_compaction();          // one leveled compaction step
+    std::uint64_t level_budget(int level) const;  // byte budget of a level (>=1)
+    // Rebuild sstables_ in read order: L0 newest->oldest, then each deeper level
+    // by key range. Leveled only. Caller holds the exclusive lock.
+    void reorder_sstables_locked();
+
     std::string dir_;
     std::string wal_path_;
     std::size_t threshold_;
     std::size_t min_merge_;
     double size_ratio_;
     std::size_t value_sep_threshold_;
+    bool leveled_;                    // compaction strategy
+    std::size_t leveled_target_bytes_;  // ~size of one file in a level (L1+)
+    std::size_t leveled_l1_bytes_;      // byte budget of L1 (deeper levels x size_ratio)
 
     Wal wal_;
     Memtable memtable_;             // active: receives writes
     // Sealed, immutable memtable awaiting background flush (empty when has_flushing_
     // is false). Reads check it after the active memtable and before the SSTables.
     Memtable flushing_memtable_;
-    std::vector<std::shared_ptr<SSTable>> sstables_;  // newest first
+    std::vector<std::shared_ptr<SSTable>> sstables_;  // read order (see reorder)
+    // Level of each live SSTable (leveled compaction). L0 = fresh flushes
+    // (overlapping); levels >= 1 are non-overlapping sorted runs. Empty / all-zero
+    // under the size-tiered strategy. Keyed by raw pointer; entries added when a
+    // table joins sstables_ and erased when it leaves.
+    std::unordered_map<const SSTable*, int> level_of_;
     // Value-log generations, keyed by generation number. New values append to the
     // current generation; older ones are kept open only to resolve pointers that
     // still reference them (until GC rewrites those away). Snapshotted by readers
